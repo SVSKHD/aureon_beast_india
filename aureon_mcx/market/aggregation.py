@@ -146,11 +146,16 @@ class TimeframeAggregator:
         start, end = self.policy.bucket(ts, self.target)
         return _Bucket(open_time=start, end_time=end, expected=self.policy.expected_opens(start, end, self.source))
 
-    def _emit(self) -> AggregationResult:
+    def _emit(self) -> AggregationResult | None:
         b = self._bucket
         assert b is not None
         self._bucket = None
         self._last_emitted_open = b.open_time
+        if not b.expected:
+            # closed-market bucket (holiday / outside session): nothing is expected, nothing is emitted
+            log.debug("aggregation_bucket_dropped symbol=%s target=%s bucket=%s reason=no_expected_constituents", self.symbol,
+                      self.target.value, b.open_time.isoformat())
+            return None
         ordered = sorted({**b.extra, **b.constituents}.values(), key=lambda c: c.open_time)
         first, last = ordered[0], ordered[-1]
         oi = next((c.open_interest for c in reversed(ordered) if c.open_interest is not None), None)
@@ -188,7 +193,9 @@ class TimeframeAggregator:
             return []  # bucket already emitted: never re-open a closed bar
         out: list[AggregationResult] = []
         if self._bucket is not None and start > self._bucket.open_time:
-            out.append(self._emit())  # a later bucket arrived: the previous boundary has passed
+            res = self._emit()  # a later bucket arrived: the previous boundary has passed
+            if res is not None:
+                out.append(res)
         elif self._bucket is not None and start < self._bucket.open_time:
             return out  # older than the open bucket and not emitted: out-of-order beyond repair window
         if self._bucket is None:
@@ -207,7 +214,9 @@ class TimeframeAggregator:
         if b.expected and all(t in b.constituents for t in b.expected):
             last_close = max(c.close_time for c in b.constituents.values())
             if last_close >= b.end_time:
-                out.append(self._emit())
+                res = self._emit()
+                if res is not None:
+                    out.append(res)
         return out
 
     def mark_emitted_until(self, open_time: datetime) -> None:

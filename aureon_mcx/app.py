@@ -1,4 +1,4 @@
-"""Application: the ordered startup flow and the live run loop.
+"""Application: the ordered startup flow, the supervised live run loop, recovery and rollover.
 
 Startup (any failure in steps 1-9 aborts with a clear error):
  1 load config            2 validate Dhan credentials (never printed)
@@ -7,6 +7,15 @@ Startup (any failure in steps 1-9 aborts with a clear error):
  7 SQLite WAL + migrations 8 historical M5 / M15 / H1 (H4 aggregated locally)
  9 warm indicators       10 connect WebSocket   11 subscribe   12 observer
 13 Discord               14 service health
+
+Runtime guarantees
+  * every feed (re)connect triggers M1 gap recovery through the same pipeline before a
+    symbol is LIVE; an unrecoverable gap suspends that symbol's analytics (ERROR);
+  * contract rollover is staged: the new contract is fully warmed and seeded before the
+    atomic switch; a failed warmup keeps the old contract running;
+  * background tasks are supervised: feed / flush / housekeeping are restarted with
+    backoff (repeated failure shuts the service down safely), Discord failure degrades
+    health to discord=ERROR and retries while observation continues.
 """
 from __future__ import annotations
 
@@ -14,8 +23,9 @@ import asyncio
 import logging
 import signal
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from aureon_mcx.broker.dhan import DhanApiError, DhanError, DhanInstrumentProvider, ResolvedContract, SymbolResolutionError, SymbolResolver
 from aureon_mcx.broker.dhan.client import DhanHttpClient
@@ -23,10 +33,11 @@ from aureon_mcx.broker.dhan.errors import DhanCredentialsError
 from aureon_mcx.broker.dhan.historical import CachedHistoricalProvider, DhanHistoricalProvider
 from aureon_mcx.broker.dhan.live_feed import DhanLiveFeedProvider
 from aureon_mcx.config import AppConfig, ConfigError, load_config
+from aureon_mcx.continuity import ContinuityService
 from aureon_mcx.health import HealthState
 from aureon_mcx.logging_setup import configure_logging, kv
 from aureon_mcx.market.candle import Candle
-from aureon_mcx.market.candle_builder import CandlePipeline, Tick
+from aureon_mcx.market.candle_builder import CandlePipeline, GapRecord, Tick
 from aureon_mcx.market.sessions import SessionCalendar
 from aureon_mcx.market.timeframe import Timeframe
 from aureon_mcx.market.timeutil import IST, utc_now
@@ -43,11 +54,32 @@ class StartupError(RuntimeError):
     pass
 
 
+@dataclass
+class SymbolRuntime:
+    """Everything that belongs to one active contract; swapped atomically on rollover."""
+
+    contract: ResolvedContract
+    observer: SymbolObserver
+    history: dict[Timeframe, list[Candle]]
+    pipeline: CandlePipeline | None = None
+
+
+@dataclass
+class TaskSpec:
+    name: str
+    factory: Callable[[], Awaitable[None]]
+    critical: bool
+    max_restarts: int = 5
+    restarts: int = 0
+    backoff: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
 class Application:
     def __init__(self, config_dir: str | None = None, env_file: str | None = None, *, http_factory: Callable[..., Any] | None = None,
                  instrument_provider_factory: Callable[..., Any] | None = None, historical_factory: Callable[..., Any] | None = None,
                  feed_factory: Callable[..., Any] | None = None, sink_factory: Callable[..., Any] | None = None,
-                 now: Callable[[], datetime] = utc_now, validate_credentials_remotely: bool = True):
+                 now: Callable[[], datetime] = utc_now, validate_credentials_remotely: bool = True,
+                 housekeeping_interval: float = 30.0):
         self._config_dir = config_dir
         self._env_file = env_file
         self._http_factory = http_factory or (lambda cfg: DhanHttpClient(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value()))
@@ -58,22 +90,47 @@ class Application:
         self._sink_factory = sink_factory
         self._now = now
         self._validate_remote = validate_credentials_remotely
+        self.housekeeping_interval = housekeeping_interval
+        self.task_backoff_scale = 1.0  # tests shrink restart backoffs
         self.cfg: AppConfig | None = None
         self.http = None
         self.resolver: SymbolResolver | None = None
-        self.contracts: dict[str, ResolvedContract] = {}
         self.db: Database | None = None
         self.repos: Repositories | None = None
         self.calendar: SessionCalendar | None = None
         self.health = HealthState()
         self.sink: PresentationSink = NullSink()
-        self.observers: dict[str, SymbolObserver] = {}
-        self.pipelines: dict[str, CandlePipeline] = {}
-        self.history: dict[str, dict[Timeframe, list[Candle]]] = {}
+        self.runtimes: dict[str, SymbolRuntime] = {}
+        self.historical = None
+        self.continuity: ContinuityService | None = None
         self.feed = None
         self.discord_client = None
-        self.stop: asyncio.Event | None = None  # created inside run()
+        self.stop: asyncio.Event | None = None
         self.startup_log: list[str] = []
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._specs: dict[str, TaskSpec] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self.task_failures: list[tuple[str, str]] = []
+
+    # ---------------------------------------------------------- compat views
+    @property
+    def contracts(self) -> dict[str, ResolvedContract]:
+        return {s: r.contract for s, r in self.runtimes.items()}
+
+    @property
+    def observers(self) -> dict[str, SymbolObserver]:
+        return {s: r.observer for s, r in self.runtimes.items()}
+
+    @property
+    def history(self) -> dict[str, dict[Timeframe, list[Candle]]]:
+        return {s: r.history for s, r in self.runtimes.items()}
+
+    @property
+    def pipelines(self) -> dict[str, CandlePipeline]:
+        return {r.contract.security_id: r.pipeline for r in self.runtimes.values() if r.pipeline is not None}
+
+    def _runtime_for_security(self, security_id: str) -> SymbolRuntime | None:
+        return next((r for r in self.runtimes.values() if r.contract.security_id == security_id), None)
 
     # ------------------------------------------------------------------ steps
     def _step(self, n: int, text: str) -> None:
@@ -115,83 +172,179 @@ class Application:
         master = self.resolver.refresh(force=False)
         self._step(3, f"instrument master records={len(master.records)} version={master.version}")
         # 4/5 resolve
+        contracts: dict[str, ResolvedContract] = {}
         for i, sym in enumerate(cfg.logical_symbols, start=4):
-            self.contracts[sym] = self.resolver.resolve(sym)  # raises SymbolResolutionError -> abort
+            contracts[sym] = self.resolver.resolve(sym)  # raises SymbolResolutionError -> abort
             self._step(min(i, 5), f"resolved {sym}")
         # 6 publish metadata (log now; DB row + Discord line once storage / Discord exist)
-        for sym, c in self.contracts.items():
+        for sym, c in contracts.items():
             log.info("symbol_resolved %s", kv(logical=sym, security_id=c.security_id, expiry=c.expiry_iso, display=c.display_symbol,
                                               lot_size=c.lot_size, tick_size=c.tick_size))
+            self.health.set_symbol_state(sym, "WARMING", "startup", security_id=c.security_id, expiry=c.expiry_iso)
         self._step(6, "instrument metadata published")
         # 7 storage
-        self.db = Database(cfg.env.AUREON_LOCAL_DB_PATH if cfg.env.AUREON_STORAGE_BACKEND == "sqlite" else cfg.env.AUREON_LOCAL_DB_PATH)
         if cfg.env.AUREON_STORAGE_BACKEND != "sqlite":
             # DECISION: PostgreSQL backend is selectable in config but not implemented; fail closed.
             raise StartupError(f"storage backend {cfg.env.AUREON_STORAGE_BACKEND!r} is not implemented in this build")
+        self.db = Database(cfg.env.AUREON_LOCAL_DB_PATH)
         version = self.db.migrate()
         self.repos = Repositories(self.db)
-        for c in self.contracts.values():
+        for c in contracts.values():
             self.repos.instruments.upsert_active(c.as_row())
         self._step(7, f"sqlite ready schema_version={version} path={cfg.env.AUREON_LOCAL_DB_PATH}")
-        # 8 historical
+        # 8 / 9 historical + warm (per symbol, via the same routine used by rollover)
         archive = ParquetArchive(cfg.env.AUREON_PARQUET_DIR, cfg.env.AUREON_PARQUET_ARCHIVE)
-        cached = CachedHistoricalProvider(self._historical_factory(cfg, self.http), self.repos, archive)
-        now = self._now()
-        for sym, c in self.contracts.items():
-            hist: dict[Timeframe, list[Candle]] = {}
-            for tf in cfg.mtf_timeframes:
-                if tf == Timeframe.H4:
-                    continue
-                bars = cfg.analysis.historical.warmup_bars.get(tf, 200)
-                start, end = warmup_window(bars, tf, now)
-                candles = cached.load(sym, c.security_id, c.exchange_segment, c.instrument_type, c.expiry_iso, tf, start, end)
-                hist[tf] = candles[-bars:]
-                log.info("historical_warmup %s %s bars=%d", sym, tf.value, len(hist[tf]))
-            if Timeframe.H4 in cfg.mtf_timeframes:
-                hist[Timeframe.H4] = derive_h4(hist.get(Timeframe.H1, []), now=now)
-                log.info("historical_warmup %s H4 bars=%d (aggregated from closed H1)", sym, len(hist[Timeframe.H4]))
-            if len(hist.get(cfg.primary_timeframe, [])) < cfg.env.EMA_SLOW + 5:
-                raise StartupError(f"insufficient {cfg.primary_timeframe.value} history for {sym}: {len(hist.get(cfg.primary_timeframe, []))} bars")
-            self.history[sym] = hist
+        self.historical = self._historical_factory(cfg, self.http)
+        self._cached = CachedHistoricalProvider(self.historical, self.repos, archive)
+        self.continuity = ContinuityService(self.historical, self.repos, self.calendar, self.health, self._now, cfg.primary_timeframe)
+        for sym, c in contracts.items():
+            self.runtimes[sym] = self._prepare_symbol(sym, c, "WARMING")
         self._step(8, "historical context loaded")
-        # 9 warm indicators (observers)
-        outcomes = OutcomeService(self.repos, cfg.analysis, self.calendar)
-        for sym, c in self.contracts.items():
-            obs = SymbolObserver(cfg, c, self.repos, self.calendar, outcomes, self.sink, self.health)
-            obs.warm(self.history[sym])
-            self.observers[sym] = obs
         self._step(9, "indicators warmed")
         self.health.set("config", "ok")
         self.health.set("storage", "ok", cfg.env.AUREON_LOCAL_DB_PATH)
-        self.health.set("resolver", "ok", ", ".join(f"{s}={c.security_id}" for s, c in self.contracts.items()))
+        self.health.set("resolver", "ok", ", ".join(f"{s}={c.security_id}" for s, c in contracts.items()))
 
-    # -------------------------------------------------------------- live run
-    def _on_tick(self, tick: Tick) -> None:
-        p = self.pipelines.get(tick.security_id)
-        if p is not None:
-            p.add_tick(tick)
+    # ------------------------------------------------------ symbol preparation
+    def _load_history(self, sym: str, c: ResolvedContract) -> dict[Timeframe, list[Candle]]:
+        assert self.cfg is not None and self.calendar is not None
+        cfg = self.cfg
+        now = self._now()
+        hist: dict[Timeframe, list[Candle]] = {}
+        for tf in cfg.mtf_timeframes:
+            if tf == Timeframe.H4:
+                continue
+            bars = cfg.analysis.historical.warmup_bars.get(tf, 200)
+            start, end = warmup_window(bars, tf, now)
+            candles = self._cached.load(sym, c.security_id, c.exchange_segment, c.instrument_type, c.expiry_iso, tf, start, end)
+            hist[tf] = candles[-bars:]
+            log.info("historical_warmup %s %s bars=%d", sym, tf.value, len(hist[tf]))
+        if Timeframe.H4 in cfg.mtf_timeframes:
+            hist[Timeframe.H4] = derive_h4(hist.get(Timeframe.H1, []), now=now, calendar=self.calendar)
+            log.info("historical_warmup %s H4 bars=%d (aggregated from closed H1)", sym, len(hist[Timeframe.H4]))
+        n = len(hist.get(cfg.primary_timeframe, []))
+        if n < cfg.env.EMA_SLOW + 5:
+            raise StartupError(f"insufficient {cfg.primary_timeframe.value} history for {sym} ({c.security_id}): {n} bars")
+        return hist
+
+    def _prepare_symbol(self, sym: str, c: ResolvedContract, state: str) -> SymbolRuntime:
+        """Load history, warm a fresh observer and seed a pipeline for a contract. Raises on failure."""
+        assert self.cfg is not None and self.repos is not None and self.calendar is not None
+        self.health.set_symbol_state(sym, state, f"preparing {c.security_id}", security_id=c.security_id, expiry=c.expiry_iso)
+        hist = self._load_history(sym, c)
+        outcomes = OutcomeService(self.repos, self.cfg.analysis, self.calendar)
+        obs = SymbolObserver(self.cfg, c, self.repos, self.calendar, outcomes, self.sink, self.health)
+        obs.warm(hist)
+        rt = SymbolRuntime(contract=c, observer=obs, history=hist)
+        rt.pipeline = self._make_pipeline(rt)
+        return rt
+
+    def _make_pipeline(self, rt: SymbolRuntime) -> CandlePipeline:
+        assert self.cfg is not None
+        sym = rt.contract.logical_symbol
+        p = CandlePipeline(sym, rt.contract.security_id, rt.contract.expiry_iso, self.cfg.primary_timeframe, self.cfg.mtf_timeframes,
+                           lambda candle, o=rt.observer: o.on_closed_candle(candle), calendar=self.calendar,
+                           on_gap=lambda gap, s=sym: self._on_gap(s, gap), clock=self._now)
+        seed_pipeline(p, rt.history)
+        return p
 
     def _build_pipelines(self) -> None:
-        assert self.cfg is not None
-        for sym, c in self.contracts.items():
-            obs = self.observers[sym]
-            p = CandlePipeline(sym, c.security_id, c.expiry_iso, self.cfg.primary_timeframe, self.cfg.mtf_timeframes,
-                               lambda candle, o=obs: o.on_closed_candle(candle))
-            seed_pipeline(p, self.history[sym])
-            self.pipelines[c.security_id] = p
+        for rt in self.runtimes.values():
+            if rt.pipeline is None:
+                rt.pipeline = self._make_pipeline(rt)
 
+    # ------------------------------------------------------------ feed hooks
+    def _on_tick(self, tick: Tick) -> None:
+        rt = self._runtime_for_security(tick.security_id)
+        if rt is None or rt.pipeline is None:
+            return
+        self.health.tick_seen(rt.contract.logical_symbol, tick.ts)
+        rt.pipeline.add_tick(tick)
+
+    def _on_feed_status(self, status: str, detail: dict) -> None:
+        self.health.set("feed", status, str(detail))
+        now = self._now()
+        for rt in self.runtimes.values():
+            sh = self.health.symbol(rt.contract.logical_symbol)
+            sh.reconnects = int(detail.get("reconnects", sh.reconnects)) if status == "connected" else sh.reconnects
+            if status == "connected":
+                sh.feed_connected = True
+                if rt.pipeline is not None:
+                    rt.pipeline.set_connected(now)
+            else:
+                sh.feed_connected = False
+                if rt.pipeline is not None:
+                    rt.pipeline.set_disconnected()
+        if status == "connected" and self._loop is not None:
+            self._loop.create_task(self.recover_all(), name="recovery")
+
+    def _on_gap(self, sym: str, gap: GapRecord) -> None:
+        rt = self.runtimes.get(sym)
+        if rt is None or self.continuity is None:
+            return
+        self.continuity.record_gap(rt.contract, gap)
+        self.health.set_symbol_state(sym, "ERROR", f"data gap {gap.timeframe.value} {gap.open_time.isoformat()} missing={len(gap.missing)}",
+                                     unresolved_gaps=len(rt.pipeline.unresolved_gaps) if rt.pipeline else 1)
+        if self._loop is not None:
+            self._loop.create_task(self.repair(sym), name=f"repair:{sym}")
+
+    async def recover_all(self) -> None:
+        for sym in list(self.runtimes):
+            await self.recover(sym)
+
+    async def recover(self, sym: str) -> bool:
+        rt = self.runtimes.get(sym)
+        if rt is None or rt.pipeline is None or self.continuity is None:
+            return False
+        p = rt.pipeline
+        if p.recovering:
+            return False
+        p.begin_recovery()
+        try:
+            fallback = rt.history.get(self.cfg.primary_timeframe, [])[-1].close_time if rt.history.get(self.cfg.primary_timeframe) else None
+            ok = await asyncio.to_thread(self.continuity.recover, rt.contract, p, fallback)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("recovery_error %s", kv(symbol=sym, error=type(exc).__name__))
+            ok = False
+        finally:
+            p.end_recovery()
+        return self._settle_symbol_state(sym, ok)
+
+    async def repair(self, sym: str) -> bool:
+        rt = self.runtimes.get(sym)
+        if rt is None or rt.pipeline is None or self.continuity is None:
+            return False
+        try:
+            await asyncio.to_thread(self.continuity.repair, rt.contract, rt.pipeline)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("repair_error %s", kv(symbol=sym, error=type(exc).__name__))
+        return self._settle_symbol_state(sym, True)
+
+    def _settle_symbol_state(self, sym: str, recovered: bool) -> bool:
+        rt = self.runtimes[sym]
+        p = rt.pipeline
+        assert p is not None
+        gaps = len(p.unresolved_gaps)
+        if recovered and p.continuity_ok:
+            self.health.set_symbol_state(sym, "LIVE", "continuity restored", unresolved_gaps=0)
+            return True
+        detail = f"unresolved gaps={gaps}" if gaps else "recovery failed; analytics suspended"
+        self.health.set_symbol_state(sym, "ERROR", detail, unresolved_gaps=gaps)
+        self.sink.status(self.health.status_line())
+        return False
+
+    # -------------------------------------------------------------- live run
     async def run(self) -> None:
         assert self.cfg is not None and self.repos is not None
         cfg = self.cfg
         self.stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
+        self._loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, self.stop.set)
+                self._loop.add_signal_handler(sig, self.stop.set)
             except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows / nested loops
                 pass
         # 13 (sink first so status lines have a destination) - Discord is presentation only
-        tasks: list[asyncio.Task] = []
         if self._sink_factory is not None:
             self.sink, self.discord_client = self._sink_factory(cfg, self.repos)
         elif cfg.env.DISCORD_TOKEN and cfg.env.DISCORD_CHANNEL_ID:
@@ -201,30 +354,36 @@ class Application:
 
             refs = MessageRefs(self.repos)
             self.sink = DiscordSink(UpdateCoalescer(refs, cfg.analysis.discord.debounce_seconds))
-            self.discord_client = create_client(cfg, self.repos, self.sink, refs, MonitorRegistry())
+            self.discord_client = create_client(cfg, self.repos, self.sink, refs, MonitorRegistry(self.repos))
         else:
             log.warning("discord_disabled %s", kv(reason="DISCORD_TOKEN / DISCORD_CHANNEL_ID not set; running headless"))
             self.sink = NullSink()
-        for obs in self.observers.values():
-            obs.sink = self.sink
+        for rt in self.runtimes.values():
+            rt.observer.sink = self.sink
         # 10 / 11 websocket + subscriptions
-        ids = [c.security_id for c in self.contracts.values()]
+        ids = [rt.contract.security_id for rt in self.runtimes.values()]
         if self._feed_factory is not None:
             self.feed = self._feed_factory(cfg, self._on_tick, self.health)
+            if hasattr(self.feed, "on_status"):
+                self.feed.on_status = self._on_feed_status
         else:
             self.feed = DhanLiveFeedProvider(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value(),
-                                             cfg.env.EXCHANGE_SEGMENT, self._on_tick, lambda s, d: self.health.set("feed", s, str(d)))
+                                             cfg.env.EXCHANGE_SEGMENT, self._on_tick, self._on_feed_status)
         await self.feed.subscribe(ids)
         self._build_pipelines()
-        tasks.append(asyncio.create_task(self.feed.run(self.stop), name="feed"))
+        self._specs["feed"] = TaskSpec("feed", lambda: self.feed.run(self.stop), critical=True)
+        self._start("feed")
         self._step(10, "websocket connecting")
         self._step(11, f"subscribed {','.join(ids)}")
         # 12 observer: wall-clock boundary flush
-        tasks.append(asyncio.create_task(self._flush_loop(), name="flush"))
+        self._specs["flush"] = TaskSpec("flush", self._flush_loop, critical=True)
+        self._start("flush")
         self._step(12, "observer live")
         log.info("observer live")
         if self.discord_client is not None:
-            tasks.append(asyncio.create_task(self.discord_client.start(cfg.env.DISCORD_TOKEN.get_secret_value()), name="discord"))
+            self._specs["discord"] = TaskSpec("discord", lambda: self.discord_client.start(cfg.env.DISCORD_TOKEN.get_secret_value()),
+                                              critical=False, max_restarts=1000, backoff=(5.0, 15.0, 30.0, 60.0))
+            self._start("discord")
             self.health.set("discord", "starting")
             log.info("discord live")
         else:
@@ -235,77 +394,176 @@ class Application:
         self.health.set("feed", "connecting")
         self.sink.status("\n".join([f"{s} -> security_id {c.security_id} -> expiry {c.expiry_iso}" for s, c in self.contracts.items()]
                                    + [self.health.status_line()]))
-        tasks.append(asyncio.create_task(self._housekeeping_loop(), name="housekeeping"))
+        self._specs["housekeeping"] = TaskSpec("housekeeping", self._housekeeping_loop, critical=True)
+        self._start("housekeeping")
         self._step(14, "service health published")
         log.info("service_health %s", kv(**{k: v["status"] for k, v in self.health.snapshot()["components"].items()}))
-        await self.stop.wait()
-        await self.shutdown(tasks)
+        await self._supervise()
+        await self.shutdown()
 
+    # ----------------------------------------------------------- supervision
+    def _start(self, name: str) -> None:
+        spec = self._specs[name]
+        self._tasks[name] = asyncio.create_task(spec.factory(), name=name)
+
+    async def _supervise(self) -> None:
+        assert self.stop is not None
+        stop_task = asyncio.create_task(self.stop.wait(), name="stop")
+        try:
+            while not self.stop.is_set():
+                pending = {t for t in self._tasks.values() if not t.done()}
+                done, _ = await asyncio.wait(pending | {stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                if stop_task in done:
+                    break
+                for t in done:
+                    await self._handle_task_exit(t)
+        finally:
+            stop_task.cancel()
+
+    async def _handle_task_exit(self, task: asyncio.Task) -> None:
+        name = task.get_name()
+        spec = self._specs.get(name)
+        exc = None if task.cancelled() else task.exception()
+        if exc is None:
+            if self.stop is not None and not self.stop.is_set() and spec is not None:
+                log.warning("task_exited %s", kv(task=name))
+            return
+        self.task_failures.append((name, type(exc).__name__))
+        log.error("task_failed %s", kv(task=name, error=type(exc).__name__, detail=str(exc)[:200]), exc_info=exc)
+        if spec is None:
+            return
+        self.health.set(name, "error", f"{type(exc).__name__}: {str(exc)[:120]}")
+        if spec.restarts >= spec.max_restarts:
+            if spec.critical:
+                log.critical("task_restart_limit %s", kv(task=name, restarts=spec.restarts))
+                self.health.set("observer", "error", f"{name} failed repeatedly; shutting down")
+                self.sink.status(self.health.status_line())
+                assert self.stop is not None
+                self.stop.set()
+            return
+        delay = spec.backoff[min(spec.restarts, len(spec.backoff) - 1)] * self.task_backoff_scale
+        spec.restarts += 1
+        self.sink.status(self.health.status_line())
+        log.warning("task_restart %s", kv(task=name, delay=delay, attempt=spec.restarts))
+        assert self.stop is not None
+        try:
+            await asyncio.wait_for(self.stop.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+        if name == "discord" and self.discord_client is not None and self.discord_client.is_closed():
+            self.health.set("discord", "restarting")
+        self._start(name)
+
+    # ------------------------------------------------------------------ loops
     async def _flush_loop(self) -> None:
+        assert self.stop is not None
         grace = timedelta(seconds=2)
         while not self.stop.is_set():
             now = self._now() - grace
             for p in self.pipelines.values():
-                try:
-                    p.flush_at(now)
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("flush_error %s", kv(error=type(exc).__name__))
+                p.flush_at(now)  # exceptions propagate to the supervisor (never swallowed)
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
+    def _stale_check(self) -> None:
+        assert self.cfg is not None and self.calendar is not None
+        now = self._now()
+        if not self.calendar.is_open(now):
+            return
+        limit = timedelta(seconds=2 * self.cfg.primary_timeframe.seconds + 60)
+        for sym, rt in self.runtimes.items():
+            sh = self.health.symbol(sym)
+            if sh.state != "LIVE" or not sh.feed_connected or rt.pipeline is None:
+                continue
+            last = rt.pipeline.last_closed.get(self.cfg.primary_timeframe)
+            if last is not None and now - last > limit:
+                self.health.set_symbol_state(sym, "STALE", f"no closed {self.cfg.primary_timeframe.value} since {last.isoformat()}")
+
     async def _housekeeping_loop(self) -> None:
-        assert self.cfg is not None
+        assert self.cfg is not None and self.stop is not None
         last_master = self._now()
+        last_line = ""
         while not self.stop.is_set():
             try:
-                await asyncio.wait_for(self.stop.wait(), timeout=300.0)
+                await asyncio.wait_for(self.stop.wait(), timeout=self.housekeeping_interval)
             except asyncio.TimeoutError:
                 pass
             if self.stop.is_set():
                 break
-            self.health.set("feed", "live" if getattr(self.feed, "connected", False) else "reconnecting")
-            self.sink.status(self.health.status_line())
-            log.info("service_health %s", kv(line=self.health.status_line()))
+            self._stale_check()
+            line = self.health.status_line()
+            if line != last_line:
+                last_line = line
+                self.sink.status(line)
+                log.info("service_health %s", kv(line=line.replace("\n", " | ")))
             if self._now() - last_master >= timedelta(hours=self.cfg.symbols.instrument_master.refresh_hours):
                 last_master = self._now()
                 await self.check_rollover()
 
+    # --------------------------------------------------------------- rollover
     async def check_rollover(self) -> None:
-        """Daily: refresh the instrument master and swap subscriptions when a contract rolled."""
+        """Daily: refresh the instrument master; roll contracts through the staged process."""
         assert self.resolver is not None and self.cfg is not None and self.repos is not None
         try:
-            self.resolver.refresh(force=True)
+            await asyncio.to_thread(self.resolver.refresh, True)
         except DhanError as exc:
             log.warning("instrument_master_refresh_failed %s", kv(error=str(exc)))
             return
-        for sym in list(self.contracts):
+        for sym in list(self.runtimes):
             try:
                 new = self.resolver.resolve(sym)
             except SymbolResolutionError as exc:
                 log.error("rollover_resolution_failed %s", kv(logical=sym, reason=exc.reason))
                 continue
-            old = self.contracts[sym]
-            if new.security_id == old.security_id:
-                continue
-            log.warning("rollover %s", kv(logical=sym, old_security_id=old.security_id, new_security_id=new.security_id, expiry=new.expiry_iso))
-            self.repos.instruments.upsert_active(new.as_row())
-            self.contracts[sym] = new
-            outcomes = OutcomeService(self.repos, self.cfg.analysis, self.calendar)
-            obs = SymbolObserver(self.cfg, new, self.repos, self.calendar, outcomes, self.sink, self.health)
-            self.observers[sym] = obs
-            self.history[sym] = {tf: [] for tf in self.cfg.mtf_timeframes}
-            p = CandlePipeline(sym, new.security_id, new.expiry_iso, self.cfg.primary_timeframe, self.cfg.mtf_timeframes,
-                               lambda candle, o=obs: o.on_closed_candle(candle))
-            self.pipelines.pop(old.security_id, None)
-            self.pipelines[new.security_id] = p
-            if self.feed is not None:
-                await self.feed.replace_subscription(old.security_id, new.security_id)
-            self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso}")
+            if new.security_id != self.runtimes[sym].contract.security_id:
+                await self.roll_symbol(sym, new)
 
-    async def shutdown(self, tasks: list[asyncio.Task]) -> None:
+    async def roll_symbol(self, sym: str, new: ResolvedContract) -> bool:
+        """Staged rollover: prepare (history, warm, seed) -> subscribe -> atomic switch -> unsubscribe old.
+        Any failure keeps the old contract running untouched."""
+        assert self.repos is not None
+        old_rt = self.runtimes[sym]
+        old = old_rt.contract
+        log.warning("rollover_begin %s", kv(logical=sym, old_security_id=old.security_id, new_security_id=new.security_id, expiry=new.expiry_iso))
+        try:
+            new_rt = await asyncio.to_thread(self._prepare_symbol, sym, new, "ROLLOVER_WARMING")
+        except (StartupError, DhanError, Exception) as exc:  # noqa: BLE001
+            log.error("rollover_failed %s", kv(logical=sym, new_security_id=new.security_id, error=type(exc).__name__, detail=str(exc)[:200]))
+            self.health.set_symbol_state(sym, "LIVE" if old_rt.pipeline is not None and old_rt.pipeline.continuity_ok else "ERROR",
+                                         f"rollover to {new.security_id} failed: {type(exc).__name__}; old contract retained",
+                                         security_id=old.security_id, expiry=old.expiry_iso)
+            self.sink.status(f"{sym} rollover to security_id {new.security_id} FAILED; keeping {old.security_id}")
+            return False
+        ind = new_rt.observer.indicators[self.cfg.primary_timeframe].latest
+        if ind is None or not ind.warmed:
+            log.error("rollover_not_warm %s", kv(logical=sym, new_security_id=new.security_id))
+            self.health.set_symbol_state(sym, "LIVE", f"rollover to {new.security_id} aborted: indicators not warm", security_id=old.security_id)
+            return False
+        # subscribe the new contract first, then switch atomically, then drop the old one
+        if self.feed is not None:
+            await self.feed.subscribe([new.security_id])
+        self.repos.instruments.upsert_active(new.as_row())
+        if self.feed is not None and getattr(self.feed, "connected", False):
+            new_rt.pipeline.set_connected(self._now())
+        self.runtimes[sym] = new_rt
+        if self.feed is not None:
+            await self.feed.unsubscribe([old.security_id])
+        self.health.set_symbol_state(sym, "LIVE", f"rolled from {old.security_id}", security_id=new.security_id, expiry=new.expiry_iso,
+                                     unresolved_gaps=0)
+        log.warning("rollover_complete %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso))
+        self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso}")
+        if self._loop is not None and getattr(self.feed, "connected", False):
+            self._loop.create_task(self.recover(sym), name=f"recovery:{sym}")
+        return True
+
+    # --------------------------------------------------------------- shutdown
+    async def shutdown(self) -> None:
         log.info("shutdown_begin")
+        if self.stop is not None:
+            self.stop.set()
         if self.feed is not None and hasattr(self.feed, "disconnect"):
             try:
                 await self.feed.disconnect()
@@ -316,9 +574,9 @@ class Application:
                 await self.discord_client.close()
             except Exception:  # noqa: BLE001
                 pass
-        for t in tasks:
+        for t in self._tasks.values():
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         if self.db is not None:
             self.db.close()
         if self.http is not None and hasattr(self.http, "close"):

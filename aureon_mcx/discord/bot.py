@@ -58,14 +58,26 @@ class DiscordSink:
 
 
 class MonitorRegistry:
-    def __init__(self):
-        self.subscribers: dict[int, set[int]] = {}
+    """Monitor subscriptions persisted in `monitor_subscriptions` (restored on startup)."""
 
-    def add(self, setup_id: int, user_id: int) -> bool:
+    def __init__(self, repos: Repositories | None = None):
+        self.repos = repos
+        self.subscribers: dict[int, set[str]] = {}
+        if repos is not None:
+            for sid, users in repos.monitors.all().items():
+                self.subscribers[sid] = set(users)
+
+    def add(self, setup_id: int, user_id: int | str) -> bool:
+        uid = str(user_id)
         s = self.subscribers.setdefault(setup_id, set())
-        if user_id in s:
+        if uid in s:
             return False
-        s.add(user_id)
+        s.add(uid)
+        if self.repos is not None:
+            try:
+                self.repos.monitors.add(setup_id, uid)
+            except Exception as exc:  # noqa: BLE001 - e.g. setup row missing; keep the in-memory subscription
+                log.warning("monitor_persist_failed %s", kv(setup_id=setup_id, error=type(exc).__name__))
         return True
 
     def mentions(self, setup_id: int) -> str:
@@ -149,7 +161,15 @@ def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: 
         async def _render_and_send(self, ch, view: SetupView) -> None:
             spec = build_card(view)
             embed = to_embed(spec)
-            png = await asyncio.to_thread(render_chart_from_storage, repos, view, cfg.analysis.declutter, cfg.primary_timeframe)
+            # Chart rendering is off the event loop (to_thread; Database serialises access with
+            # its own lock). A chart failure never loses the card update: send it without the chart.
+            try:
+                png = await asyncio.to_thread(render_chart_from_storage, repos, view, cfg.analysis.declutter, cfg.primary_timeframe)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("discord_chart_failed %s", kv(setup_id=view.setup_id, error=type(exc).__name__))
+                png = b""
+                spec.footer = spec.footer + " · chart unavailable (render error logged)"
+                embed = to_embed(spec)
             h = view.state_hash()
             ref = refs.message(view.setup_id)
             files = [discord.File(io.BytesIO(png), filename=f"setup_{view.setup_id}.png")] if png else []
