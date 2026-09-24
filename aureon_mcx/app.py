@@ -111,6 +111,17 @@ class Application:
         self._specs: dict[str, TaskSpec] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self.task_failures: list[tuple[str, str]] = []
+        self._verify_inflight: dict[str, bool] = {}
+        self._bg_tasks: set[asyncio.Task] = set()  # strong references: asyncio keeps only weak refs to tasks
+
+    def _spawn(self, coro, name: str) -> asyncio.Task | None:
+        if self._loop is None:
+            coro.close()
+            return None
+        task = self._loop.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ---------------------------------------------------------- compat views
     @property
@@ -196,7 +207,9 @@ class Application:
         archive = ParquetArchive(cfg.env.AUREON_PARQUET_DIR, cfg.env.AUREON_PARQUET_ARCHIVE)
         self.historical = self._historical_factory(cfg, self.http)
         self._cached = CachedHistoricalProvider(self.historical, self.repos, archive)
-        self.continuity = ContinuityService(self.historical, self.repos, self.calendar, self.health, self._now, cfg.primary_timeframe)
+        self.continuity = ContinuityService(self.historical, self.repos, self.calendar, self.health, self._now, cfg.primary_timeframe,
+                                            allow_zero_trade_fill=cfg.analysis.historical.allow_verified_zero_trade_fill,
+                                            retries=cfg.analysis.historical.verification_retries)
         for sym, c in contracts.items():
             self.runtimes[sym] = self._prepare_symbol(sym, c, "WARMING")
         self._step(8, "historical context loaded")
@@ -244,7 +257,8 @@ class Application:
         sym = rt.contract.logical_symbol
         p = CandlePipeline(sym, rt.contract.security_id, rt.contract.expiry_iso, self.cfg.primary_timeframe, self.cfg.mtf_timeframes,
                            lambda candle, o=rt.observer: o.on_closed_candle(candle), calendar=self.calendar,
-                           on_gap=lambda gap, s=sym: self._on_gap(s, gap), clock=self._now)
+                           on_gap=lambda gap, s=sym: self._on_gap(s, gap), clock=self._now,
+                           on_pending=lambda minute, reason, s=sym: self._on_pending(s, minute, reason))
         seed_pipeline(p, rt.history)
         return p
 
@@ -275,8 +289,8 @@ class Application:
                 sh.feed_connected = False
                 if rt.pipeline is not None:
                     rt.pipeline.set_disconnected()
-        if status == "connected" and self._loop is not None:
-            self._loop.create_task(self.recover_all(), name="recovery")
+        if status == "connected":
+            self._spawn(self.recover_all(), name="recovery")
 
     def _on_gap(self, sym: str, gap: GapRecord) -> None:
         rt = self.runtimes.get(sym)
@@ -285,8 +299,50 @@ class Application:
         self.continuity.record_gap(rt.contract, gap)
         self.health.set_symbol_state(sym, "ERROR", f"data gap {gap.timeframe.value} {gap.open_time.isoformat()} missing={len(gap.missing)}",
                                      unresolved_gaps=len(rt.pipeline.unresolved_gaps) if rt.pipeline else 1)
-        if self._loop is not None:
-            self._loop.create_task(self.repair(sym), name=f"repair:{sym}")
+        self._spawn(self.repair(sym), name=f"repair:{sym}")
+
+    def _on_pending(self, sym: str, minute: datetime, reason: str) -> None:
+        """A minute without trustworthy live coverage: verify it against the broker, never invent it."""
+        rt = self.runtimes.get(sym)
+        if rt is None:
+            return
+        sh = self.health.symbol(sym)
+        if sh.state in ("LIVE", "STALE"):
+            state = "STALE" if reason == "silent_feed" else "RECOVERING_GAP"
+            self.health.set_symbol_state(sym, state, f"minute {minute.isoformat()} needs broker verification ({reason})")
+        if rt.pipeline is not None and not rt.pipeline.recovering:
+            self._spawn(self.verify(sym), name=f"verify:{sym}")
+
+    async def verify(self, sym: str) -> bool:
+        """Verify pending minutes with exact broker M1 bars (bounded retries, then ERROR)."""
+        rt = self.runtimes.get(sym)
+        if rt is None or rt.pipeline is None or self.continuity is None:
+            return False
+        if self._verify_inflight.get(sym):
+            return False
+        self._verify_inflight[sym] = True
+        try:
+            p = rt.pipeline
+            retries = self.cfg.analysis.historical.verification_retries if self.cfg else 3
+            for attempt in range(1, retries + 1):
+                if not [m for m in p.pending_minutes() if m + timedelta(minutes=1) <= self._now()]:
+                    break
+                try:
+                    verified, still = await asyncio.to_thread(self.continuity.verify_pending, rt.contract, p)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("verification_error %s", kv(symbol=sym, error=type(exc).__name__))
+                    verified, still = 0, len(p.pending_minutes())
+                if not [m for m in p.pending_minutes() if m + timedelta(minutes=1) <= self._now()]:
+                    break
+                if attempt < retries:
+                    try:
+                        await asyncio.wait_for(self.stop.wait(), timeout=0.5 * self.task_backoff_scale)
+                        return False
+                    except asyncio.TimeoutError:
+                        pass
+            return self._settle_symbol_state(sym, True)
+        finally:
+            self._verify_inflight[sym] = False
 
     async def recover_all(self) -> None:
         for sym in list(self.runtimes):
@@ -325,11 +381,21 @@ class Application:
         p = rt.pipeline
         assert p is not None
         gaps = len(p.unresolved_gaps)
+        pending = p.pending_minutes()
+        closed_pending = [m for m in pending if m + timedelta(minutes=1) <= self._now()]
         if recovered and p.continuity_ok:
-            self.health.set_symbol_state(sym, "LIVE", "continuity restored", unresolved_gaps=0)
+            self.health.set_symbol_state(sym, "LIVE", "continuity verified", unresolved_gaps=0)
             return True
-        detail = f"unresolved gaps={gaps}" if gaps else "recovery failed; analytics suspended"
-        self.health.set_symbol_state(sym, "ERROR", detail, unresolved_gaps=gaps)
+        if recovered and not gaps and pending and not closed_pending:
+            # only the still-open (current) minute is pending: nothing to verify yet
+            self.health.set_symbol_state(sym, "RECOVERING_GAP", f"current minute {pending[0].isoformat()} awaits broker verification",
+                                         unresolved_gaps=0)
+            return False
+        if closed_pending and not gaps:
+            detail = f"{len(closed_pending)} minute(s) unverified by broker; analytics suspended"
+        else:
+            detail = f"unresolved gaps={gaps}" if gaps else "recovery failed; analytics suspended"
+        self.health.set_symbol_state(sym, "ERROR", detail, unresolved_gaps=gaps + len(closed_pending))
         self.sink.status(self.health.status_line())
         return False
 
@@ -481,6 +547,10 @@ class Application:
             last = rt.pipeline.last_closed.get(self.cfg.primary_timeframe)
             if last is not None and now - last > limit:
                 self.health.set_symbol_state(sym, "STALE", f"no closed {self.cfg.primary_timeframe.value} since {last.isoformat()}")
+                continue
+            tick = sh.last_tick_at
+            if tick is not None and now - tick > timedelta(seconds=90):
+                self.health.set_symbol_state(sym, "STALE", f"connected but no market data since {tick.isoformat()}")
 
     async def _housekeeping_loop(self) -> None:
         assert self.cfg is not None and self.stop is not None
@@ -555,8 +625,8 @@ class Application:
                                      unresolved_gaps=0)
         log.warning("rollover_complete %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso))
         self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso}")
-        if self._loop is not None and getattr(self.feed, "connected", False):
-            self._loop.create_task(self.recover(sym), name=f"recovery:{sym}")
+        if getattr(self.feed, "connected", False):
+            self._spawn(self.recover(sym), name=f"recovery:{sym}")
         return True
 
     # --------------------------------------------------------------- shutdown
@@ -574,9 +644,12 @@ class Application:
                 await self.discord_client.close()
             except Exception:  # noqa: BLE001
                 pass
-        for t in self._tasks.values():
+        # let in-flight verification / recovery finish briefly, then cancel everything
+        if self._bg_tasks:
+            await asyncio.wait(set(self._bg_tasks), timeout=2.0)
+        for t in list(self._tasks.values()) + list(self._bg_tasks):
             t.cancel()
-        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        await asyncio.gather(*self._tasks.values(), *self._bg_tasks, return_exceptions=True)
         if self.db is not None:
             self.db.close()
         if self.http is not None and hasattr(self.http, "close"):

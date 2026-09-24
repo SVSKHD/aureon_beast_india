@@ -77,6 +77,9 @@ class FakeHistorical:
         now = self.clock[0]
         if timeframe is Timeframe.M1:
             return [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
+        if start >= NOW:  # live-period broker bars derive from the same fake market as the ticks
+            m1 = [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
+            return aggregate_closed(m1, timeframe) if m1 else []
         # per-timeframe broker series ending at NOW (like the real warmup: exact broker candles per interval)
         n = {Timeframe.M5: 240, Timeframe.M15: 300, Timeframe.H1: 200}[timeframe]
         from aureon_mcx.market.timeutil import floor_to
@@ -89,8 +92,9 @@ class FakeHistorical:
 class FakeFeed:
     """Emits ticks derived from the shared fake market; optionally simulates an outage."""
 
-    def __init__(self, on_tick, clock, minutes=16, outage: tuple[int, int] | None = None, ids=("428291", "429003")):
+    def __init__(self, on_tick, clock, minutes=16, outage: tuple[int, int] | None = None, ids=("428291", "429003"), settle=None):
         self.on_tick = on_tick
+        self.settle = settle  # optional callable: True when nothing is pending (simulates real-time verification latency)
         self.clock = clock
         self.minutes = minutes
         self.outage = outage
@@ -135,10 +139,19 @@ class FakeFeed:
                 for t in ticks_for(series[sid][i]):
                     self.clock[0] = t.ts
                     self.on_tick(t)
-            await asyncio.sleep(0)
+            await self.wait_settled()
         self.clock[0] = NOW + timedelta(minutes=self.minutes, seconds=3)
         await asyncio.sleep(0.05)
         stop.set()
+
+    async def wait_settled(self):
+        await asyncio.sleep(0)
+        if self.settle is None:
+            return
+        for _ in range(200):  # broker verification takes a few ms here, seconds in reality: well within a minute
+            if self.settle():
+                return
+            await asyncio.sleep(0.005)
 
     async def disconnect(self):
         self.disconnected = True
@@ -157,8 +170,17 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
     hist = FakeHistorical(clock, fail_for)
     feeds = []
 
+    holder = {}
+
+    def settled():
+        app_ = holder.get("app")
+        if app_ is None:
+            return True
+        return all(rt.pipeline is None or not [m for m in rt.pipeline.pending_minutes() if m + timedelta(minutes=1) <= clock[0]]
+                   for rt in app_.runtimes.values())
+
     def feed_factory(cfg, on_tick, health):
-        f = FakeFeed(on_tick, clock, **(feed_kwargs or {}))
+        f = FakeFeed(on_tick, clock, settle=settled, **(feed_kwargs or {}))
         feeds.append(f)
         return f
 
@@ -166,6 +188,7 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
                       instrument_provider_factory=lambda cfg, http: DhanInstrumentProvider("u", tmp_path / "m.csv", 24, http, now=lambda: NOW),
                       historical_factory=lambda cfg, http: hist, feed_factory=feed_factory,
                       sink_factory=lambda cfg, repos: (NullSink(), None), now=lambda: clock[0], housekeeping_interval=0.2)
+    holder["app"] = app
     return app, fake_http, hist, feeds, clock
 
 
@@ -264,7 +287,7 @@ def test_startup_mid_bucket_recovers_missing_minutes(tmp_path, monkeypatch):
                     for t in ticks_for(series[i]):
                         clock[0] = t.ts
                         on_tick(t)
-                    await asyncio.sleep(0)
+                    await f.wait_settled()
                 clock[0] = NOW + timedelta(minutes=8, seconds=3)
                 await asyncio.sleep(0.05)
                 stop.set()
@@ -277,7 +300,7 @@ def test_startup_mid_bucket_recovers_missing_minutes(tmp_path, monkeypatch):
 
     asyncio.run(go())
     p = app.pipelines["428291"]
-    assert p.continuity_ok and not p.gaps
+    assert p.continuity_ok and all(g.resolved for g in p.gaps)  # a late-verified minute may have repaired the bucket
     m5 = [c for c in app.observers["GOLD"].candles[Timeframe.M5] if c.open_time >= NOW]
     assert [c.open_time for c in m5] == [NOW]
     ref = aggregate_closed(m1_for("428291", NOW, NOW + timedelta(minutes=5)), Timeframe.M5)[0]
