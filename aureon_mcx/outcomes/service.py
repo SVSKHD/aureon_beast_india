@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from aureon_mcx.config.yaml_models import AnalysisConfig
 from aureon_mcx.detection.models import Detection
@@ -11,17 +12,19 @@ from aureon_mcx.logging_setup import kv
 from aureon_mcx.market.candle import Candle
 from aureon_mcx.market.sessions import SessionCalendar
 from aureon_mcx.setups.models import SetupState
-from aureon_mcx.storage.repositories import Repositories
 
 from .models import FeatureSnapshot, OutcomeObservation
 from .observation import Horizon, horizons_from_config, observe
 from .snapshot import build_snapshot
 
+if TYPE_CHECKING:  # pragma: no cover - avoids storage <-> outcomes import cycle
+    from aureon_mcx.storage.repositories import Repositories
+
 log = logging.getLogger("aureon.outcomes")
 
 
 class OutcomeService:
-    def __init__(self, repos: Repositories, analysis: AnalysisConfig, calendar: SessionCalendar):
+    def __init__(self, repos: "Repositories", analysis: AnalysisConfig, calendar: SessionCalendar):
         self.repos = repos
         self.cfg = analysis
         self.calendar = calendar
