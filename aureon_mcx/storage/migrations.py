@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from typing import Callable
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -321,12 +322,10 @@ CREATE TABLE IF NOT EXISTS model_registry (
     (
         2,
         """
--- one setup per originating detection (replay / restart safety); dedupe first, keep the oldest
-DELETE FROM setups WHERE id NOT IN (SELECT MIN(id) FROM setups GROUP BY origin_detection_id);
+-- Duplicate setups per origin detection are consolidated by _consolidate_duplicate_setups()
+-- (run BEFORE this SQL): the canonical row keeps its lifecycle history, children are
+-- repointed, and only then is uniqueness enforced.  Nothing is deleted blindly.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_setups_origin_detection ON setups(origin_detection_id);
-
--- one lifecycle transition per (setup, candle, target state); dedupe first, keep the oldest
-DELETE FROM setup_events WHERE id NOT IN (SELECT MIN(id) FROM setup_events GROUP BY setup_id, candle_id, to_state);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_setup_events_transition ON setup_events(setup_id, candle_id, to_state);
 
 CREATE TABLE IF NOT EXISTS monitor_subscriptions (
@@ -353,7 +352,130 @@ CREATE TABLE IF NOT EXISTS market_data_gaps (
 );
 """,
     ),
+    (
+        3,
+        """
+-- session_state is contract-aware: after a same-day rollover the new security_id gets
+-- its own session rows instead of silently overwriting the old contract's.
+-- Rows (and their ids) are preserved through a rebuild; SQLite cannot alter constraints in place.
+CREATE TABLE session_state_v3 (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT NOT NULL,
+    security_id     TEXT NOT NULL,
+    session_date    TEXT NOT NULL,
+    session_name    TEXT NOT NULL,
+    session_group   TEXT NOT NULL,
+    trend           TEXT NOT NULL,
+    is_current      INTEGER NOT NULL DEFAULT 0,
+    open            REAL,
+    high            REAL,
+    low             REAL,
+    close           REAL,
+    bars            INTEGER NOT NULL DEFAULT 0,
+    opened_at       TEXT,
+    closed_at       TEXT,
+    last_open_time  TEXT,
+    evidence_json   TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL,
+    UNIQUE(symbol, security_id, session_date, session_name)
+);
+INSERT INTO session_state_v3(id, symbol, security_id, session_date, session_name, session_group, trend, is_current, open, high, low,
+    close, bars, opened_at, closed_at, last_open_time, evidence_json, updated_at)
+  SELECT id, symbol, security_id, session_date, session_name, session_group, trend, is_current, open, high, low,
+    close, bars, opened_at, closed_at, last_open_time, evidence_json, updated_at FROM session_state ORDER BY id;
+DROP TABLE session_state;
+ALTER TABLE session_state_v3 RENAME TO session_state;
+CREATE INDEX IF NOT EXISTS ix_session_state_lookup ON session_state(symbol, security_id, session_date);
+""",
+    ),
 ]
+
+# Python-side steps that must run BEFORE a version's SQL (data consolidation that
+# needs judgement SQL cannot express safely).
+PRE_STEPS: dict[int, "Callable[[sqlite3.Connection], None]"] = {}
+
+
+class MigrationError(RuntimeError):
+    """A migration found data it cannot consolidate safely; nothing was changed."""
+
+
+_TERMINAL = ("COMPLETED", "INVALIDATED")
+
+
+def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
+    """v2: one setup per origin detection, without destroying lifecycle state.
+
+    Canonical choice per origin_detection_id, in order: a terminal-state row (the
+    lifecycle actually finished), then the latest ``updated_open_time`` (most
+    progressed), then the richest event history, then the lowest id.  Two rows that
+    tie on every criterion but disagree on state are ambiguous: the migration fails
+    with a report instead of guessing.  Children (setup_events, clearances,
+    discord_message_refs) are repointed to the canonical row, exact duplicates among
+    them are dropped (oldest kept), and only then are the loser rows removed.
+    """
+    groups = conn.execute(
+        "SELECT origin_detection_id FROM setups GROUP BY origin_detection_id HAVING COUNT(*) > 1"
+    ).fetchall()
+    ambiguous: list[str] = []
+    for (origin_id,) in [tuple(g) for g in groups]:
+        rows = conn.execute(
+            """SELECT s.id, s.state, s.updated_open_time, s.closed_at,
+                      (SELECT COUNT(*) FROM setup_events e WHERE e.setup_id = s.id) AS events
+               FROM setups s WHERE s.origin_detection_id = ? ORDER BY s.id""",
+            (origin_id,),
+        ).fetchall()
+
+        def rank(r):
+            return (1 if r["state"] in _TERMINAL else 0, r["updated_open_time"] or "", int(r["events"]), -int(r["id"]))
+
+        ranked = sorted(rows, key=rank, reverse=True)
+        best = ranked[0]
+        ties = [r for r in ranked if rank(r)[:3] == rank(best)[:3]]
+        if len({r["state"] for r in ties}) > 1:
+            ambiguous.append(f"origin_detection_id={origin_id}: " + ", ".join(f"setup {r['id']}={r['state']}" for r in ties))
+            continue
+        canonical = int(best["id"])
+        losers = [int(r["id"]) for r in rows if int(r["id"]) != canonical]
+        marks = ",".join("?" for _ in losers)
+        # lifecycle events: move, then drop exact duplicates (keep the oldest per transition)
+        conn.execute(f"UPDATE setup_events SET setup_id = ? WHERE setup_id IN ({marks})", (canonical, *losers))
+        conn.execute(
+            """DELETE FROM setup_events WHERE setup_id = ? AND id NOT IN (
+                   SELECT MIN(id) FROM setup_events WHERE setup_id = ? GROUP BY candle_id, to_state)""",
+            (canonical, canonical),
+        )
+        # clearances: UNIQUE(setup_id, candle_id) - keep the canonical's own row when both exist
+        conn.execute(
+            f"""DELETE FROM clearances WHERE setup_id IN ({marks}) AND candle_id IN (
+                    SELECT candle_id FROM clearances WHERE setup_id = ?)""",
+            (*losers, canonical),
+        )
+        conn.execute(f"UPDATE clearances SET setup_id = ? WHERE setup_id IN ({marks})", (canonical, *losers))
+        conn.execute(
+            """DELETE FROM clearances WHERE setup_id = ? AND id NOT IN (
+                   SELECT MIN(id) FROM clearances WHERE setup_id = ? GROUP BY candle_id)""",
+            (canonical, canonical),
+        )
+        # discord card reference: UNIQUE(setup_id) - keep the canonical's, else adopt the newest loser's
+        has_ref = conn.execute("SELECT 1 FROM discord_message_refs WHERE setup_id = ?", (canonical,)).fetchone()
+        if has_ref is None:
+            newest = conn.execute(
+                f"SELECT id FROM discord_message_refs WHERE setup_id IN ({marks}) ORDER BY last_rendered_at DESC, id DESC LIMIT 1", losers
+            ).fetchone()
+            if newest is not None:
+                conn.execute("UPDATE discord_message_refs SET setup_id = ? WHERE id = ?", (canonical, int(newest["id"])))
+        conn.execute(f"DELETE FROM discord_message_refs WHERE setup_id IN ({marks})", losers)
+        conn.execute(f"DELETE FROM setups WHERE id IN ({marks})", losers)
+    if ambiguous:
+        raise MigrationError("cannot consolidate duplicate setups (tied candidates disagree on state); "
+                             "resolve manually before migrating:\n  " + "\n  ".join(ambiguous))
+    # transitions that are still duplicated inside a single setup (v1 replays): keep the oldest
+    conn.execute(
+        "DELETE FROM setup_events WHERE id NOT IN (SELECT MIN(id) FROM setup_events GROUP BY setup_id, candle_id, to_state)"
+    )
+
+
+PRE_STEPS[2] = _consolidate_duplicate_setups
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -375,6 +497,9 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
             continue
         conn.execute("BEGIN IMMEDIATE")
         try:
+            pre = PRE_STEPS.get(target)
+            if pre is not None:
+                pre(conn)
             _exec_script(conn, sql)
             conn.execute(
                 "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",

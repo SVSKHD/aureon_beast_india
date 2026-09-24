@@ -651,6 +651,12 @@ class SymbolStateRepository:
 
 
 class SessionStateRepository:
+    """Session trend rows keyed by (symbol, security_id, session_date, session_name).
+
+    The key is contract-aware (schema v3): after a same-day rollover the new contract
+    writes its own rows and the old contract's rows stay intact for audit.
+    """
+
     def __init__(self, db: Database):
         self.db = db
 
@@ -661,35 +667,51 @@ class SessionStateRepository:
                        low, close, bars, opened_at, closed_at, last_open_time, evidence_json, updated_at)
                    VALUES (:symbol, :security_id, :session_date, :session_name, :session_group, :trend, :is_current, :open, :high,
                        :low, :close, :bars, :opened_at, :closed_at, :last_open_time, :evidence_json, :updated_at)
-                   ON CONFLICT(symbol, session_date, session_name) DO UPDATE SET trend = excluded.trend, is_current = excluded.is_current,
-                       open = excluded.open, high = excluded.high, low = excluded.low, close = excluded.close, bars = excluded.bars,
-                       closed_at = excluded.closed_at, last_open_time = excluded.last_open_time, evidence_json = excluded.evidence_json,
-                       updated_at = excluded.updated_at""",
+                   ON CONFLICT(symbol, security_id, session_date, session_name) DO UPDATE SET trend = excluded.trend,
+                       is_current = excluded.is_current, open = excluded.open, high = excluded.high, low = excluded.low,
+                       close = excluded.close, bars = excluded.bars, closed_at = excluded.closed_at,
+                       last_open_time = excluded.last_open_time, evidence_json = excluded.evidence_json, updated_at = excluded.updated_at""",
                 {**rec, "updated_at": to_db(utc_now())},
             )
 
-    def clear_current(self, symbol: str, except_key: tuple[str, str] | None = None) -> None:
+    def clear_current(self, symbol: str, security_id: str | None = None, except_key: tuple[str, str] | None = None) -> None:
+        where, params = "symbol = ?", [symbol]
+        if security_id is not None:
+            where += " AND security_id = ?"
+            params.append(security_id)
+        if except_key is not None:
+            where += " AND NOT (session_date = ? AND session_name = ?)"
+            params.extend(except_key)
         with self.db.transaction() as conn:
-            if except_key is None:
-                conn.execute("UPDATE session_state SET is_current = 0 WHERE symbol = ?", (symbol,))
-            else:
-                conn.execute(
-                    "UPDATE session_state SET is_current = 0 WHERE symbol = ? AND NOT (session_date = ? AND session_name = ?)",
-                    (symbol, except_key[0], except_key[1]),
-                )
+            conn.execute(f"UPDATE session_state SET is_current = 0 WHERE {where}", tuple(params))
 
-    def for_symbol(self, symbol: str, session_date: str) -> list[sqlite3.Row]:
+    def for_symbol(self, symbol: str, session_date: str, security_id: str | None = None) -> list[sqlite3.Row]:
+        if security_id is None:
+            return self.db.query(
+                "SELECT * FROM session_state WHERE symbol = ? AND session_date = ? ORDER BY security_id, session_group, opened_at",
+                (symbol, session_date),
+            )
         return self.db.query(
-            "SELECT * FROM session_state WHERE symbol = ? AND session_date = ? ORDER BY session_group, opened_at", (symbol, session_date)
+            "SELECT * FROM session_state WHERE symbol = ? AND security_id = ? AND session_date = ? ORDER BY session_group, opened_at",
+            (symbol, security_id, session_date),
         )
 
-    def current(self, symbol: str) -> list[sqlite3.Row]:
-        return self.db.query("SELECT * FROM session_state WHERE symbol = ? AND is_current = 1", (symbol,))
+    def current(self, symbol: str, security_id: str | None = None) -> list[sqlite3.Row]:
+        if security_id is None:
+            return self.db.query("SELECT * FROM session_state WHERE symbol = ? AND is_current = 1", (symbol,))
+        return self.db.query("SELECT * FROM session_state WHERE symbol = ? AND security_id = ? AND is_current = 1", (symbol, security_id))
 
-    def latest_closed(self, symbol: str, session_name: str) -> sqlite3.Row | None:
+    def latest_closed(self, symbol: str, session_name: str, security_id: str | None = None) -> sqlite3.Row | None:
+        if security_id is None:
+            return self.db.query_one(
+                """SELECT * FROM session_state WHERE symbol = ? AND session_name = ? AND closed_at IS NOT NULL
+                   ORDER BY session_date DESC, closed_at DESC LIMIT 1""",
+                (symbol, session_name),
+            )
         return self.db.query_one(
-            "SELECT * FROM session_state WHERE symbol = ? AND session_name = ? AND closed_at IS NOT NULL ORDER BY session_date DESC LIMIT 1",
-            (symbol, session_name),
+            """SELECT * FROM session_state WHERE symbol = ? AND security_id = ? AND session_name = ? AND closed_at IS NOT NULL
+               ORDER BY session_date DESC, closed_at DESC LIMIT 1""",
+            (symbol, security_id, session_name),
         )
 
 
@@ -724,15 +746,18 @@ class SnapshotRepository:
         r = self.db.query_one("SELECT * FROM feature_snapshots WHERE detection_id = ?", (detection_id,))
         return self._to(r) if r else None
 
-    def pending_outcomes(self, limit: int = 500) -> list[FeatureSnapshot]:
-        """Snapshots that still have at least one non-final horizon (or none yet)."""
-        rows = self.db.query(
-            """SELECT s.* FROM feature_snapshots s
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM outcome_observations o WHERE o.snapshot_id = s.id AND o.horizon = '__all_final__'
-               ) ORDER BY s.id LIMIT ?""",
-            (limit,),
-        )
+    def pending_outcomes(self, security_id: str | None = None, limit: int = 500) -> list[FeatureSnapshot]:
+        """Snapshots that still have at least one non-final horizon (or none yet).
+
+        Filtered in SQL by ``security_id`` so one contract's backlog can never starve
+        another's (a Python-side filter over a LIMITed page would).
+        """
+        where = "WHERE NOT EXISTS (SELECT 1 FROM outcome_observations o WHERE o.snapshot_id = s.id AND o.horizon = '__all_final__')"
+        params: tuple[Any, ...] = (limit,)
+        if security_id is not None:
+            where += " AND s.security_id = ?"
+            params = (security_id, limit)
+        rows = self.db.query(f"SELECT s.* FROM feature_snapshots s {where} ORDER BY s.id LIMIT ?", params)
         return [self._to(r) for r in rows]
 
     def cohort(self, symbol: str, setup_family: str, direction: str, timeframe: Timeframe) -> list[FeatureSnapshot]:
