@@ -51,8 +51,8 @@ class OutcomeService:
         strictly after the detection candle.
         """
         updated = 0
-        for snap in self.repos.snapshots.pending_outcomes(limit):
-            if snap.security_id != security_id or snap.id is None:
+        for snap in self.repos.snapshots.pending_outcomes(security_id, limit):
+            if snap.id is None:
                 continue
             session_date = self.calendar.trading_date(snap.open_time)
             _, session_end = self.calendar.trading_day_span(session_date)

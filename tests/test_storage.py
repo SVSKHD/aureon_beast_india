@@ -126,3 +126,23 @@ def test_short_transaction_rollback(db):
             raise RuntimeError("boom")
     assert db.query_one("SELECT COUNT(*) AS n FROM schema_version WHERE version = 999")["n"] == 0
     assert not db.conn.in_transaction
+
+
+def test_session_state_is_contract_aware_across_same_day_rollover(repos):
+    def rec(sid, is_current, bars):
+        return {"symbol": "GOLD", "security_id": sid, "session_date": "2026-01-14", "session_name": "LONDON", "session_group": "global",
+                "trend": "UP", "is_current": is_current, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "bars": bars,
+                "opened_at": "2026-01-14T12:30:00+00:00", "closed_at": None, "last_open_time": "2026-01-14T12:30:00+00:00",
+                "evidence_json": "{}"}
+
+    repos.session_state.upsert(rec("428291", 1, 7))
+    # same-day rollover: the new contract tracks the same session without overwriting the old contract's row
+    repos.session_state.clear_current("GOLD", "428291")
+    repos.session_state.upsert(rec("431102", 1, 2))
+    rows = repos.session_state.for_symbol("GOLD", "2026-01-14")
+    assert [(r["security_id"], r["bars"], r["is_current"]) for r in rows] == [("428291", 7, 0), ("431102", 2, 1)]
+    assert [r["security_id"] for r in repos.session_state.current("GOLD")] == ["431102"]
+    assert [r["bars"] for r in repos.session_state.current("GOLD", "431102")] == [2]
+    repos.session_state.upsert(rec("431102", 1, 3))  # same contract + session: updated in place
+    assert [r["bars"] for r in repos.session_state.for_symbol("GOLD", "2026-01-14", "431102")] == [3]
+    assert repos.db.query_one("SELECT COUNT(*) AS n FROM session_state")["n"] == 2

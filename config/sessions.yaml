@@ -2,10 +2,11 @@
 # MCX hours change with US DST, so nothing here is hard-coded in code.
 timezone: Asia/Kolkata
 
-# Exchange trading day window (used for previous-day high/low frames).
+# Fallback trading-day window. The authoritative per-date hours (holidays, morning-only
+# closures, the seasonal 23:30 / 23:55 close) come from config/exchange_calendar.yaml.
 trading_day:
   start: "09:00"
-  end: "23:30"
+  end: "23:55"
 
 # Global session context windows (IST). Used for ASIA / LONDON / NEW YORK trend rows.
 sessions:
@@ -17,7 +18,7 @@ sessions:
     end: "18:30"
   - name: NEW_YORK
     start: "18:30"
-    end: "23:30"
+    end: "23:55"   # capped to the calendar's actual close for the date
 
 # MCX local session context (shown alongside the global sessions).
 mcx_sessions:
@@ -26,7 +27,7 @@ mcx_sessions:
     end: "17:00"
   - name: EVENING
     start: "17:00"
-    end: "23:30"
+    end: "23:55"   # capped to the calendar's actual close for the date
 
 # Present / session trend evaluation.
 trend:

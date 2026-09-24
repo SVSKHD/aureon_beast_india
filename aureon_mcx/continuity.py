@@ -1,16 +1,22 @@
-"""Market-data continuity service: reconnect gap recovery and broker-candle gap repair.
+"""Market-data continuity service: reconnect recovery, minute verification and gap repair.
 
 Recovery (after every feed connect):
   1. `pipeline.recovery_start()` says where processed data ends (the minute left open at
      disconnect, or the minute after the last processed M1; after warmup: the end of the
      stored primary history);
-  2. closed M1 candles for [start, now) are fetched from the Dhan historical API, flat
-     minutes inside the fetched range are filled (no trades while the exchange was open),
-     the still-open minute is never used;
+  2. closed M1 candles for [start, now) are fetched from the Dhan historical API; the
+     still-open minute is never used; nothing is invented for minutes the broker did not
+     return (see zero-trade rule below);
   3. they are fed through the SAME pipeline (`recover_m1`) in chronological order while live
      ticks are buffered, then buffered ticks are replayed;
   4. the symbol is LIVE only when the pipeline reports continuity; otherwise it stays
      RECOVERING_GAP / ERROR and analytics remain suspended (fail closed).
+
+Verification (partial first minute after a mid-minute connect, silent minutes on a
+connected socket): the exact broker M1 for each pending minute is fetched and fed through
+the pipeline (`verify_m1`). A minute the broker does not return stays pending; the
+`historical.allow_verified_zero_trade_fill` rule (default off) is the only path that may
+turn a verifiably-spanned missing bar into a zero-volume flat bar.
 
 Repair (after a GAP_DETECTED bar): the exact broker candle for the gap bucket is fetched at
 that timeframe and dispatched through `pipeline.repair`, which also releases deferred bars.
@@ -39,8 +45,9 @@ log = logging.getLogger("aureon.continuity")
 
 
 def fill_flat_minutes(candles: list[Candle], calendar: SessionCalendar) -> list[Candle]:
-    """Inside the fetched range, an open-market minute with no bar means no trades: fill it
-    flat at the previous close. Minutes outside the range are never invented."""
+    """Zero-trade fill for minutes strictly INSIDE a returned range (bars before and after
+    them). Used only when `historical.allow_verified_zero_trade_fill` is enabled; the
+    default pipeline never calls it. Minutes at the edges of the range are never invented."""
     if not candles:
         return []
     out: list[Candle] = []
@@ -52,7 +59,7 @@ def fill_flat_minutes(candles: list[Candle], calendar: SessionCalendar) -> list[
                 if calendar.is_open(t):
                     p = prev.close
                     out.append(Candle(symbol=c.symbol, security_id=c.security_id, timeframe=Timeframe.M1, open_time=t, open=p, high=p, low=p,
-                                      close=p, volume=0.0, open_interest=prev.open_interest, source="flat", is_closed=True,
+                                      close=p, volume=0.0, open_interest=prev.open_interest, source="zero_trade_verified", is_closed=True,
                                       expiry_date=c.expiry_date))
                 t += timedelta(minutes=1)
         out.append(c)
@@ -62,14 +69,19 @@ def fill_flat_minutes(candles: list[Candle], calendar: SessionCalendar) -> list[
 
 class ContinuityService:
     def __init__(self, historical: "HistoricalProvider", repos: Repositories, calendar: SessionCalendar, health: HealthState,
-                 now: Callable[[], datetime], primary: Timeframe, flat_fill: bool = True):
+                 now: Callable[[], datetime], primary: Timeframe, allow_zero_trade_fill: bool = False, retries: int = 3):
         self.historical = historical
         self.repos = repos
         self.calendar = calendar
         self.health = health
         self._now = now
         self.primary = primary
-        self.flat_fill = flat_fill
+        self.allow_zero_trade_fill = allow_zero_trade_fill
+        self.retries = max(1, retries)
+
+    def _fetch_m1(self, contract: ResolvedContract, start: datetime, end: datetime) -> list[Candle]:
+        return self.historical.fetch(contract.logical_symbol, contract.security_id, contract.exchange_segment, contract.instrument_type,
+                                     contract.expiry_iso, Timeframe.M1, start, end)
 
     # ------------------------------------------------------------- recovery
     def recover(self, contract: ResolvedContract, pipeline: CandlePipeline, fallback_start: datetime | None) -> bool:
@@ -85,25 +97,55 @@ class ContinuityService:
         if start >= current_minute:
             return pipeline.continuity_ok  # nothing closed was missed
         self.health.set_symbol_state(sym, "RECOVERING_GAP", f"backfilling M1 from {start.isoformat()} to {current_minute.isoformat()}")
-        try:
-            fetched = self.historical.fetch(sym, contract.security_id, contract.exchange_segment, contract.instrument_type, contract.expiry_iso,
-                                            Timeframe.M1, start, current_minute)
-        except DhanError as exc:
-            log.error("continuity_recovery_failed %s", kv(symbol=sym, error=str(exc)))
-            self.health.set_symbol_state(sym, "ERROR", f"gap recovery failed: {exc}")
-            return False
-        closed = [c for c in fetched if c.is_closed and start <= c.open_time < current_minute]
-        if self.flat_fill:
-            closed = fill_flat_minutes(closed, self.calendar)
-        fed = pipeline.recover_m1(closed)
         expected = [t for t in _minutes(start, current_minute) if self.calendar.is_open(t)]
-        covered = {c.open_time for c in closed}
-        missing = [t for t in expected if t not in covered and t not in pipeline._seen_m1]
-        log.info("continuity_recovered %s", kv(symbol=sym, fetched=len(fetched), fed=fed, expected=len(expected), missing=len(missing)))
-        if missing:
-            self.health.set_symbol_state(sym, "ERROR", f"{len(missing)} open-market minutes unavailable from broker after recovery")
-            return False
-        return True
+        missing: list[datetime] = expected
+        fetched: list[Candle] = []
+        for attempt in range(1, self.retries + 1):
+            try:
+                fetched = self._fetch_m1(contract, start, current_minute)
+            except DhanError as exc:
+                log.error("continuity_recovery_failed %s", kv(symbol=sym, attempt=attempt, error=str(exc)))
+                if attempt == self.retries:
+                    self.health.set_symbol_state(sym, "ERROR", f"gap recovery failed: {exc}")
+                    return False
+                continue
+            closed = [c for c in fetched if c.is_closed and start <= c.open_time < current_minute]
+            if self.allow_zero_trade_fill:
+                closed = fill_flat_minutes(closed, self.calendar)
+            fed = pipeline.recover_m1(closed)
+            covered = {c.open_time for c in closed}
+            missing = [t for t in expected if t not in covered and t not in pipeline._seen_m1]
+            log.info("continuity_recovered %s", kv(symbol=sym, attempt=attempt, fetched=len(fetched), fed=fed, expected=len(expected),
+                                                     missing=len(missing)))
+            if not missing:
+                return True
+        # the broker did not return every open-market minute: nothing is invented (fail closed)
+        for m in missing:
+            pipeline._mark_pending(m, "broker_missing")
+        self.health.set_symbol_state(sym, "ERROR", f"{len(missing)} open-market minutes unavailable from broker after recovery")
+        return False
+
+    # ---------------------------------------------------------- verification
+    def verify_pending(self, contract: ResolvedContract, pipeline: CandlePipeline) -> tuple[int, int]:
+        """Fetch exact broker M1 bars for the pipeline's pending minutes. Returns (verified, still_pending)."""
+        sym = contract.logical_symbol
+        now = self._now()
+        closed_pending = [m for m in pipeline.pending_minutes() if m + timedelta(minutes=1) <= now]
+        if not closed_pending:
+            return 0, len(pipeline.pending_minutes())
+        start = closed_pending[0]
+        end = closed_pending[-1] + timedelta(minutes=1)
+        # widen by one minute on each side so a zero-trade rule (if enabled) can prove the span
+        fetch_start = start - timedelta(minutes=1)
+        fetch_end = min(end + timedelta(minutes=1), floor_to(now, 60, self.calendar.tz))
+        try:
+            fetched = self._fetch_m1(contract, fetch_start, fetch_end)
+        except DhanError as exc:
+            log.error("continuity_verification_failed %s", kv(symbol=sym, error=str(exc), pending=len(closed_pending)))
+            return 0, len(pipeline.pending_minutes())
+        verified, still = pipeline.verify_m1(fetched, now, self.allow_zero_trade_fill, (fetch_start, fetch_end))
+        log.info("continuity_verified %s", kv(symbol=sym, fetched=len(fetched), verified=len(verified), pending=len(still)))
+        return len(verified), len(still)
 
     # --------------------------------------------------------------- repair
     def repair(self, contract: ResolvedContract, pipeline: CandlePipeline) -> int:

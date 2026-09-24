@@ -170,30 +170,72 @@ def test_session_overrides_file_is_loaded(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------- flat fill / gaps
-def test_flat_fill_only_while_connected_and_open(cal):
+def test_partial_minute_after_mid_minute_connect_is_untrusted(cal):
     b = M1CandleBuilder("GOLD", "428291", is_open=cal.is_open)
+    t = ist(2026, 9, 21, 10, 2)
+    b.set_connected(t + timedelta(seconds=30))  # connected at 10:02:30
+    b.add_tick(Tick("428291", 70000, t + timedelta(seconds=31), last_qty=1))
+    out = b.add_tick(Tick("428291", 70010, t + timedelta(minutes=1, seconds=1), last_qty=1))
+    assert len(out) == 1 and not out[0].trusted and out[0].candle.source == "partial"
+    assert out[0].candle.open_time == t
+    # the next minute had coverage from its start -> trusted
+    out2 = b.add_tick(Tick("428291", 70020, t + timedelta(minutes=2, seconds=1), last_qty=1))
+    assert len(out2) == 1 and out2[0].trusted and out2[0].candle.open_time == t + timedelta(minutes=1)
+    # a disconnect while a minute is open makes that minute untrusted
+    b.set_disconnected()
+    b.set_connected(t + timedelta(minutes=2, seconds=40))
+    out3 = b.flush_at(t + timedelta(minutes=3, seconds=2))
+    assert len(out3) == 1 and not out3[0].trusted
+
+
+def test_silent_minutes_are_never_fabricated(cal):
+    """Connected socket, no ticks for three minutes: no flat bars, minutes queued for verification."""
+    closed, pending = [], []
+    p = CandlePipeline("GOLD", "428291", "e", Timeframe.M5, [Timeframe.M5, Timeframe.M15], closed.append, calendar=cal,
+                       on_pending=lambda m, r: pending.append((m, r)))
     t = ist(2026, 9, 21, 10, 0)
-    b.set_connected(t)
-    b.add_tick(Tick("428291", 70000, t + timedelta(seconds=5), last_qty=1))
-    out = b.add_tick(Tick("428291", 70010, t + timedelta(minutes=3, seconds=5), last_qty=1))  # 10:01, 10:02 had no ticks
-    assert [c.open_time.astimezone(IST).strftime("%H:%M") for c in out] == ["10:00", "10:01", "10:02"]
-    assert out[1].source == "flat" and out[1].volume == 0 and out[1].close == 70000 and out[1].high == out[1].low == 70000
-    # disconnected minutes are NOT flat-filled: they are gaps
-    b2 = M1CandleBuilder("GOLD", "428291", is_open=cal.is_open)
-    b2.set_connected(t)
-    b2.add_tick(Tick("428291", 70000, t + timedelta(seconds=5), last_qty=1))
-    b2.set_disconnected()
-    b2.set_connected(t + timedelta(minutes=3))
-    out2 = b2.add_tick(Tick("428291", 70010, t + timedelta(minutes=3, seconds=5), last_qty=1))
-    assert [c.open_time.astimezone(IST).strftime("%H:%M") for c in out2] == ["10:00"]
-    # closed market minutes are never flat filled
-    b3 = M1CandleBuilder("GOLD", "428291", is_open=cal.is_open)
-    tclose = ist(2026, 9, 21, 23, 28)
-    b3.set_connected(tclose)
-    b3.add_tick(Tick("428291", 70000, tclose + timedelta(seconds=5), last_qty=1))
-    b3.add_tick(Tick("428291", 70001, tclose + timedelta(minutes=1, seconds=5), last_qty=1))
-    flushed = b3.flush_at(ist(2026, 9, 22, 9, 0))
-    assert [c.open_time.astimezone(IST).strftime("%H:%M") for c in flushed] == ["23:29"]
+    p.set_connected(t)
+    for i in range(0, 60, 20):
+        p.add_tick(Tick("428291", 70000 + i, t + timedelta(seconds=i), last_qty=1))
+    # wall clock advances through 10:01, 10:02, 10:03 with no ticks at all
+    p.flush_at(t + timedelta(minutes=4, seconds=2))
+    assert p.last_m1_open == t  # only 10:00 was built from ticks
+    assert [(m.astimezone(IST).strftime("%H:%M"), r) for m, r in pending] == [("10:01", "silent_feed"), ("10:02", "silent_feed"), ("10:03", "silent_feed")]
+    assert p.pending_minutes() and not p.continuity_ok and closed == []
+    assert p.primary_agg.partial is not None and p.primary_agg.partial.volume == 3  # no fabricated volume-0 bars inside the bucket
+    # broker verification delivers the exact bars -> they enter the same pipeline
+    broker = m1_series(4, start=t)[1:]
+    verified, still = p.verify_m1(broker, now=t + timedelta(minutes=4, seconds=2))
+    assert len(verified) == 3 and still == [] and p.continuity_ok
+    p.add_tick(Tick("428291", 70000, t + timedelta(minutes=4, seconds=1), last_qty=1))
+    p.add_tick(Tick("428291", 70000, t + timedelta(minutes=5, seconds=1), last_qty=1))
+    m5 = [c for c in closed if c.timeframe is Timeframe.M5]
+    assert len(m5) == 1 and m5[0].open_time == t and m5[0].volume == 3 + sum(c.volume for c in broker) + 1
+
+
+def test_missing_broker_minute_is_not_invented_by_default(cal):
+    closed = []
+    p = CandlePipeline("GOLD", "428291", "e", Timeframe.M5, [Timeframe.M5], closed.append, calendar=cal)
+    t = ist(2026, 9, 21, 10, 0)
+    p.set_connected(t)
+    p.add_tick(Tick("428291", 70000, t + timedelta(seconds=1), last_qty=1))
+    p.flush_at(t + timedelta(minutes=3, seconds=2))  # 10:01 and 10:02 silent
+    broker = m1_series(3, start=t)
+    del broker[1]  # broker has 10:00 and 10:02 but not 10:01
+    verified, still = p.verify_m1(broker, now=t + timedelta(minutes=3, seconds=2))
+    assert [m.astimezone(IST).strftime("%H:%M") for m in verified] == ["10:02"]
+    assert [m.astimezone(IST).strftime("%H:%M") for m in still] == ["10:01"] and not p.continuity_ok
+    # explicit, documented zero-trade rule: only when bars exist on both sides inside the fetched range
+    verified2, still2 = p.verify_m1(broker, now=t + timedelta(minutes=3, seconds=2), allow_zero_trade_fill=True,
+                                    fetched_range=(t, t + timedelta(minutes=3)))
+    assert [m.astimezone(IST).strftime("%H:%M") for m in verified2] == ["10:01"] and still2 == [] and p.continuity_ok
+    # an edge minute (no bar after it) is never filled even with the rule enabled
+    p2 = CandlePipeline("GOLD", "428291", "e", Timeframe.M5, [Timeframe.M5], closed.append, calendar=cal)
+    p2.set_connected(t)
+    p2.add_tick(Tick("428291", 70000, t + timedelta(seconds=1), last_qty=1))
+    p2.flush_at(t + timedelta(minutes=2, seconds=2))  # 10:01 silent
+    v3, s3 = p2.verify_m1(m1_series(1, start=t), now=t + timedelta(minutes=2, seconds=2), allow_zero_trade_fill=True, fetched_range=(t, t + timedelta(minutes=2)))
+    assert v3 == [] and len(s3) == 1
 
 
 def _pipeline(cal, closed, gaps=None):
@@ -216,6 +258,7 @@ def test_pipeline_gap_suspends_dispatch_then_repair_resumes(cal):
     assert not p.suspended and p.continuity_ok and gaps[0].resolved
     assert [c.open_time.astimezone(IST).strftime("%H:%M") for c in closed] == ["10:00", "10:05"]
     assert closed[0].source == "dhan"
+    p.add_tick(Tick("428291", 70000, ist(2026, 9, 21, 10, 14) + timedelta(seconds=30), last_qty=1))
     p.add_tick(Tick("428291", 70000, ist(2026, 9, 21, 10, 15) + timedelta(seconds=1), last_qty=1))
     assert [(c.timeframe.value, c.open_time.astimezone(IST).strftime("%H:%M")) for c in closed] == [
         ("M5", "10:00"), ("M5", "10:05"), ("M5", "10:10"), ("M15", "10:00")]
@@ -258,7 +301,7 @@ def test_pipeline_recovery_restores_uninterrupted_result(cal):
                 continue
             for t in ticks_for(c):
                 p.add_tick(t)
-        p.flush_at(start + timedelta(minutes=61))
+        p.flush_at(start + timedelta(minutes=60, seconds=2))  # closes 09:59; 10:00 is still the current minute
         return closed, p
 
     base, _ = run(None)
@@ -287,3 +330,28 @@ def test_pipeline_duplicate_and_out_of_order_candle_delivery_is_harmless(cal):
     # a late duplicate of an already-dispatched M1 is ignored, never re-opening a bar
     p.on_m1_closed(m1[2])
     assert len([c for c in closed if c.timeframe is Timeframe.M5]) == 3
+
+
+def test_off_session_constituent_never_alters_trusted_bar(app_config):
+    """An extreme print outside market hours that lands inside a bucket is audit-only: the
+    bar built from the expected (in-session) constituents must be identical with or without it."""
+    cal = SessionCalendar(app_config.sessions)
+    # 2026-09-21 (US DST): MCX closes 23:30 IST, so the H1 bucket 23:00 holds six M5 (23:00..23:25)
+    start = datetime(2026, 9, 21, 17, 30, tzinfo=timezone.utc)  # 23:00 IST
+    m5 = make_candles(6, start=start, tf=Timeframe.M5)
+    reference = aggregate_with_status(m5, Timeframe.H1, calendar=cal)
+    assert len(reference) == 1 and reference[0].status is Completeness.COMPLETE
+    rogue = Candle(symbol="GOLD", security_id="428291", timeframe=Timeframe.M5, open_time=start + timedelta(minutes=35),  # 23:35 IST
+                   open=1.0, high=999999.0, low=0.5, close=1.0, volume=1e9, open_interest=1.0, expiry_date="2026-10-05")
+    with_rogue = aggregate_with_status(m5 + [rogue], Timeframe.H1, calendar=cal)
+    assert len(with_rogue) == 1 and with_rogue[0].status is Completeness.COMPLETE
+    assert with_rogue[0].candle == reference[0].candle
+    assert with_rogue[0].candle.high < 999999.0 and with_rogue[0].candle.volume == reference[0].candle.volume
+    assert with_rogue[0].candle.open_interest == reference[0].candle.open_interest
+    # a bucket that holds ONLY an off-session print is a gap with no bar, never a fabricated one
+    agg = TimeframeAggregator(Timeframe.M5, Timeframe.H1, "GOLD", "428291", "2026-10-05", calendar=cal)
+    assert agg.add(rogue) == []
+    assert agg.partial is None
+    res = agg.flush_at(start + timedelta(hours=1))
+    assert res is not None and res.status is Completeness.GAP_DETECTED and res.candle is None
+    assert res.expected == 6 and res.present == 0 and res.open_time == start and res.timeframe is Timeframe.H1

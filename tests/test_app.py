@@ -77,6 +77,9 @@ class FakeHistorical:
         now = self.clock[0]
         if timeframe is Timeframe.M1:
             return [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
+        if start >= NOW:  # live-period broker bars derive from the same fake market as the ticks
+            m1 = [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
+            return aggregate_closed(m1, timeframe) if m1 else []
         # per-timeframe broker series ending at NOW (like the real warmup: exact broker candles per interval)
         n = {Timeframe.M5: 240, Timeframe.M15: 300, Timeframe.H1: 200}[timeframe]
         from aureon_mcx.market.timeutil import floor_to
@@ -89,8 +92,9 @@ class FakeHistorical:
 class FakeFeed:
     """Emits ticks derived from the shared fake market; optionally simulates an outage."""
 
-    def __init__(self, on_tick, clock, minutes=16, outage: tuple[int, int] | None = None, ids=("428291", "429003")):
+    def __init__(self, on_tick, clock, minutes=16, outage: tuple[int, int] | None = None, ids=("428291", "429003"), settle=None):
         self.on_tick = on_tick
+        self.settle = settle  # optional callable: True when nothing is pending (simulates real-time verification latency)
         self.clock = clock
         self.minutes = minutes
         self.outage = outage
@@ -135,10 +139,19 @@ class FakeFeed:
                 for t in ticks_for(series[sid][i]):
                     self.clock[0] = t.ts
                     self.on_tick(t)
-            await asyncio.sleep(0)
+            await self.wait_settled()
         self.clock[0] = NOW + timedelta(minutes=self.minutes, seconds=3)
         await asyncio.sleep(0.05)
         stop.set()
+
+    async def wait_settled(self):
+        await asyncio.sleep(0)
+        if self.settle is None:
+            return
+        for _ in range(200):  # broker verification takes a few ms here, seconds in reality: well within a minute
+            if self.settle():
+                return
+            await asyncio.sleep(0.005)
 
     async def disconnect(self):
         self.disconnected = True
@@ -157,8 +170,17 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
     hist = FakeHistorical(clock, fail_for)
     feeds = []
 
+    holder = {}
+
+    def settled():
+        app_ = holder.get("app")
+        if app_ is None:
+            return True
+        return all(rt.pipeline is None or not [m for m in rt.pipeline.pending_minutes() if m + timedelta(minutes=1) <= clock[0]]
+                   for rt in app_.runtimes.values())
+
     def feed_factory(cfg, on_tick, health):
-        f = FakeFeed(on_tick, clock, **(feed_kwargs or {}))
+        f = FakeFeed(on_tick, clock, settle=settled, **(feed_kwargs or {}))
         feeds.append(f)
         return f
 
@@ -166,6 +188,7 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
                       instrument_provider_factory=lambda cfg, http: DhanInstrumentProvider("u", tmp_path / "m.csv", 24, http, now=lambda: NOW),
                       historical_factory=lambda cfg, http: hist, feed_factory=feed_factory,
                       sink_factory=lambda cfg, repos: (NullSink(), None), now=lambda: clock[0], housekeeping_interval=0.2)
+    holder["app"] = app
     return app, fake_http, hist, feeds, clock
 
 
@@ -264,7 +287,7 @@ def test_startup_mid_bucket_recovers_missing_minutes(tmp_path, monkeypatch):
                     for t in ticks_for(series[i]):
                         clock[0] = t.ts
                         on_tick(t)
-                    await asyncio.sleep(0)
+                    await f.wait_settled()
                 clock[0] = NOW + timedelta(minutes=8, seconds=3)
                 await asyncio.sleep(0.05)
                 stop.set()
@@ -277,7 +300,7 @@ def test_startup_mid_bucket_recovers_missing_minutes(tmp_path, monkeypatch):
 
     asyncio.run(go())
     p = app.pipelines["428291"]
-    assert p.continuity_ok and not p.gaps
+    assert p.continuity_ok and all(g.resolved for g in p.gaps)  # a late-verified minute may have repaired the bucket
     m5 = [c for c in app.observers["GOLD"].candles[Timeframe.M5] if c.open_time >= NOW]
     assert [c.open_time for c in m5] == [NOW]
     ref = aggregate_closed(m1_for("428291", NOW, NOW + timedelta(minutes=5)), Timeframe.M5)[0]
@@ -383,6 +406,107 @@ def test_rollover_is_staged_and_warm(tmp_path, monkeypatch):
     assert any("rolled -> security_id 431102" in s for s in app.sink.statuses)
 
 
+def _record_states(app):
+    states = []
+    orig = app.health.set_symbol_state
+
+    def rec(sym, state, detail="", **fields):
+        states.append(state)
+        return orig(sym, state, detail, **fields)
+
+    app.health.set_symbol_state = rec
+    return states
+
+
+def test_rollover_state_progression_never_live_before_recovery(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    states = _record_states(app)
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        app.health.set_symbol_state("GOLD", "LIVE")
+        states.clear()
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+
+    asyncio.run(go())
+    assert states[0] == "ROLLOVER_WARMING"
+    assert "RECOVERING_GAP" in states and states[-1] == "LIVE"
+    assert states.index("RECOVERING_GAP") < states.index("LIVE")
+    assert "LIVE" not in states[: states.index("RECOVERING_GAP")]  # never ROLLOVER_WARMING -> LIVE -> RECOVERING
+
+
+def test_rollover_keeps_recovering_when_current_minute_is_partial(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    clock[0] = NOW + timedelta(seconds=30)  # rollover happens half way through a minute
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+        # a tick in the partial minute, then the minute closes
+        app._on_tick(Tick("431102", 71000.0, NOW + timedelta(seconds=35), last_qty=1))
+        assert app.health.symbols["GOLD"].state == "RECOVERING_GAP"
+        clock[0] = NOW + timedelta(minutes=1, seconds=2)
+        app._on_tick(Tick("431102", 71001.0, NOW + timedelta(minutes=1, seconds=1), last_qty=1))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if app.health.symbols["GOLD"].state == "LIVE":
+                break
+
+    asyncio.run(go())
+    p = app.pipelines["431102"]
+    assert NOW not in p.pending_verification and app.health.symbols["GOLD"].state == "LIVE"
+    assert [c for c in hist.calls if c[1] == "431102" and c[2] is Timeframe.M1], "partial minute verified against broker M1"
+    assert p.last_m1_open == NOW and p.m1._last_close == m1_for("431102", NOW, NOW + timedelta(minutes=1))[0].close
+
+
+def test_rollover_ticks_during_subscribe_are_not_lost(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    injected = []
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        orig_sub = feed.subscribe
+
+        async def subscribe(ids):
+            await orig_sub(ids)
+            if "431102" in ids:
+                # the broker starts streaming immediately: five full minutes + the first tick of the next one
+                for c in m1_for("431102", NOW, NOW + timedelta(minutes=5)):
+                    for t in ticks_for(c):
+                        clock[0] = t.ts
+                        injected.append(t)
+                        app._on_tick(t)
+                t = Tick("431102", 71000.0, NOW + timedelta(minutes=5, seconds=1), last_qty=0.0)
+                clock[0] = t.ts
+                injected.append(t)
+                app._on_tick(t)
+
+        feed.subscribe = subscribe
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+
+    asyncio.run(go())
+    assert app.contracts["GOLD"].security_id == "431102" and injected
+    p = app.pipelines["431102"]
+    assert p.last_m1_open == NOW + timedelta(minutes=5) or p.m1.open_minute == NOW + timedelta(minutes=5)
+    ref = aggregate_closed(m1_for("431102", NOW, NOW + timedelta(minutes=5)), Timeframe.M5)[0]
+    live = [c for c in app.observers["GOLD"].candles[Timeframe.M5] if c.open_time >= NOW]
+    assert len(live) == 1 and (live[0].open, live[0].high, live[0].low, live[0].close, live[0].volume) == (ref.open, ref.high, ref.low, ref.close, ref.volume)
+    assert app.health.symbols["GOLD"].state == "LIVE" and app.health.symbols["GOLD"].last_tick_at == injected[-1].ts
+    assert not app.pending_runtimes
+
+
 def test_rollover_failure_keeps_old_contract(tmp_path, monkeypatch):
     app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
     app.startup()
@@ -452,6 +576,71 @@ def test_supervisor_restarts_failed_feed_and_degrades_discord(tmp_path, monkeypa
     assert app.observers["GOLD"].closed_count > 0 and app.health.symbols["GOLD"].state == "LIVE"  # observation continued
     assert dead.starts >= 2  # retried
     assert "discord=error" in app.health.status_line() or "discord=restarting" in app.health.status_line()
+
+
+def test_supervisor_restarts_tasks_that_return_normally_while_running(tmp_path, monkeypatch):
+    """A supervised loop that *returns* (no exception) while stop is not set is a silent
+    failure: the feed stops delivering ticks, the flush loop stops closing candles.  The
+    supervisor must restart it exactly as it would after a crash."""
+    monkeypatch.setenv("DISCORD_TOKEN", "d-token")
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", "1")
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 3, "ids": ("428291",)})
+    app.task_backoff_scale = 0.01
+    app.startup()
+    attempts = {"feed": 0, "flush": 0}
+
+    class QuietlyReturningFeed(FakeFeed):
+        async def run(self, stop):
+            attempts["feed"] += 1
+            if attempts["feed"] == 1:
+                return  # socket loop ended without raising - the feed is now silent
+            await super().run(stop)
+
+    def feed_factory(cfg, on_tick, health):
+        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",))
+        feeds.append(f)
+        return f
+
+    real_flush = app._flush_loop
+
+    async def flush_that_returns_once():
+        attempts["flush"] += 1
+        if attempts["flush"] == 1:
+            return
+        await real_flush()
+
+    class QuietDiscord:
+        def __init__(self):
+            self.starts = 0
+
+        async def start(self, token):
+            self.starts += 1  # gateway closed without an exception
+
+        def is_closed(self):
+            return True
+
+        async def close(self):
+            pass
+
+    quiet = QuietDiscord()
+    app._feed_factory = feed_factory
+    app._flush_loop = flush_that_returns_once
+    app._sink_factory = lambda cfg, repos: (NullSink(), quiet)
+    asyncio.run(app.run())
+    assert attempts["feed"] == 2 and attempts["flush"] == 2  # both restarted after returning early
+    assert ("feed", "TaskExited") in app.task_failures and ("flush", "TaskExited") in app.task_failures
+    assert quiet.starts >= 2
+    assert app.observers["GOLD"].closed_count > 0 and app.health.symbols["GOLD"].state == "LIVE"  # observation continued
+    assert app.health.components["discord"].status in ("error", "restarting")
+
+
+def test_supervisor_ignores_normal_returns_at_shutdown(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 2, "ids": ("428291",)})
+    app.task_backoff_scale = 0.01
+    app.startup()
+    asyncio.run(app.run())
+    assert app.stop.is_set()
+    assert not any(kind == "TaskExited" for _, kind in app.task_failures)  # orderly exits are not failures
 
 
 def test_critical_task_repeated_failure_shuts_down_safely(tmp_path, monkeypatch):

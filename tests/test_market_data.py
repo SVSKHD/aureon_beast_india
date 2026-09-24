@@ -58,13 +58,14 @@ def test_cached_provider_never_refetches_same_range(repos):
 
 def test_m1_builder_closed_candles_only():
     b = M1CandleBuilder("GOLD", "428291", "2026-10-05")
-    t0 = datetime(2026, 9, 21, 3, 30, 5, tzinfo=timezone.utc)
-    assert b.add_tick(Tick("428291", 70000, t0, last_qty=2)) == []
+    t0 = datetime(2026, 9, 21, 3, 30, 0, tzinfo=timezone.utc)
+    b.set_connected(t0)  # coverage from the minute's very start
+    assert b.add_tick(Tick("428291", 70000, t0 + timedelta(seconds=5), last_qty=2)) == []
     assert b.add_tick(Tick("428291", 70010, t0 + timedelta(seconds=20), last_qty=3)) == []
     assert b.partial is not None and b.partial.is_closed is False
     out = b.add_tick(Tick("428291", 69990, t0 + timedelta(seconds=61), last_qty=1))
-    assert len(out) == 1 and out[0].is_closed
-    m1 = out[0]
+    assert len(out) == 1 and out[0].trusted and out[0].candle.is_closed
+    m1 = out[0].candle
     assert (m1.open, m1.high, m1.low, m1.close, m1.volume) == (70000, 70010, 70000, 70010, 5)
     # late tick for the closed minute is ignored, never reopens
     assert b.add_tick(Tick("428291", 1.0, t0 + timedelta(seconds=30), last_qty=1)) == []
@@ -72,7 +73,7 @@ def test_m1_builder_closed_candles_only():
     # wall clock flush
     assert b.flush_at(t0 + timedelta(seconds=90)) == []
     flushed = b.flush_at(t0 + timedelta(seconds=120))
-    assert len(flushed) == 1 and flushed[0].close == 69990
+    assert len(flushed) == 1 and flushed[0].candle.close == 69990 and flushed[0].trusted
 
 
 def test_m1_builder_day_volume_delta():
@@ -80,7 +81,7 @@ def test_m1_builder_day_volume_delta():
     t0 = datetime(2026, 9, 21, 3, 30, 0, tzinfo=timezone.utc)
     b.add_tick(Tick("428291", 1, t0, day_volume=100))
     b.add_tick(Tick("428291", 1, t0 + timedelta(seconds=10), day_volume=130))
-    c = b.add_tick(Tick("428291", 1, t0 + timedelta(seconds=70), day_volume=135))[0]
+    c = b.add_tick(Tick("428291", 1, t0 + timedelta(seconds=70), day_volume=135))[0].candle
     assert c.volume == 30
 
 
@@ -142,6 +143,7 @@ def test_pipeline_fires_once_per_closed_candle():
     closed: list[Candle] = []
     p = CandlePipeline("GOLD", "428291", "2026-10-05", Timeframe.M5, [Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4], closed.append)
     t0 = datetime(2026, 9, 21, 3, 30, tzinfo=timezone.utc)
+    p.set_connected(t0)  # trustworthy coverage from the first minute's start
     # one tick every 20 seconds for 31 minutes
     n = 0
     for s in range(0, 31 * 60, 20):

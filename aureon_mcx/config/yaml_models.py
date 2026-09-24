@@ -190,14 +190,149 @@ class SessionOverridesConfig(StrictModel):
         return self
 
 
+class CalendarSessionSpec(StrictModel):
+    start: str = "09:00"
+    evening_start: str = "17:00"
+    end: str = "23:55"
+
+    @field_validator("start", "evening_start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        parse_hhmm(v)
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _order(self) -> "CalendarSessionSpec":
+        if not (parse_hhmm(self.start) < parse_hhmm(self.evening_start) < parse_hhmm(self.end)):
+            raise ValueError("default_session must satisfy start < evening_start < end")
+        return self
+
+
+class ClosePeriod(StrictModel):
+    """Inclusive date range with its own trading-day end (seasonal close, e.g. US DST)."""
+
+    from_date: str = Field(alias="from")
+    to_date: str = Field(alias="to")
+    end: str
+    note: str = ""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    @field_validator("from_date", "to_date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+    @field_validator("end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        parse_hhmm(v)
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _range(self) -> "ClosePeriod":
+        if self.to_date < self.from_date:
+            raise ValueError(f"close period {self.from_date}..{self.to_date} is reversed")
+        return self
+
+
+class CalendarHoliday(StrictModel):
+    date: str
+    name: str
+    closed: Literal["full", "morning", "evening"]
+    note: str = ""
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+
+class CalendarSpecialSession(StrictModel):
+    date: str
+    start: str
+    end: str
+    note: str = ""
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        parse_hhmm(v)
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _order(self) -> "CalendarSpecialSession":
+        if parse_hhmm(self.end) <= parse_hhmm(self.start):
+            raise ValueError(f"special session {self.date}: end must be after start")
+        return self
+
+
+class ExchangeCalendarConfig(StrictModel):
+    """`config/exchange_calendar.yaml`: the authoritative exchange calendar (fails loudly if malformed)."""
+
+    exchange: str = "MCX"
+    segment: str = "commodity_derivatives_non_agri"
+    year: int | None = None
+    verified_against_official_circular: bool = False
+    weekend_closed: bool = True
+    default_session: CalendarSessionSpec = CalendarSessionSpec()
+    close_periods: list[ClosePeriod] = Field(default_factory=list)
+    holidays: list[CalendarHoliday] = Field(default_factory=list)
+    special_sessions: list[CalendarSpecialSession] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "ExchangeCalendarConfig":
+        dates = [h.date for h in self.holidays]
+        if len(dates) != len(set(dates)):
+            raise ValueError("exchange calendar: duplicate holiday dates")
+        specials = [x.date for x in self.special_sessions]
+        if len(specials) != len(set(specials)):
+            raise ValueError("exchange calendar: duplicate special session dates")
+        periods = sorted(self.close_periods, key=lambda p: p.from_date)
+        for a, b in zip(periods, periods[1:]):
+            if b.from_date <= a.to_date:
+                raise ValueError(f"exchange calendar: overlapping close periods {a.from_date}..{a.to_date} and {b.from_date}..{b.to_date}")
+        for p in self.close_periods:
+            if parse_hhmm(p.end) <= parse_hhmm(self.default_session.evening_start):
+                raise ValueError(f"exchange calendar: close period end {p.end} must be after evening_start")
+        # An unpopulated calendar would silently treat every holiday as an open market day and
+        # every DST-season evening as open until 23:55: refuse it instead of guessing.
+        if not self.holidays:
+            raise ValueError("exchange calendar: no holidays listed; populate it from the MCX circular")
+        if self.year is None:
+            raise ValueError("exchange calendar: 'year' is required")
+        all_dates = dates + specials + [p.from_date for p in self.close_periods] + [p.to_date for p in self.close_periods]
+        wrong_year = [d for d in all_dates if not str(d).startswith(f"{self.year}-")]
+        if wrong_year:
+            raise ValueError(f"exchange calendar: dates outside year {self.year}: {', '.join(str(d) for d in wrong_year[:5])}")
+        return self
+
+
 class SessionsConfig(StrictModel):
     timezone: str = "Asia/Kolkata"
     trading_day: TradingDaySpec = TradingDaySpec()
     sessions: list[SessionWindow]
     mcx_sessions: list[SessionWindow] = Field(default_factory=list)
     trend: TrendSpec = TrendSpec()
-    # Populated by the loader from config/session_overrides.yaml (optional file).
+    # Legacy date overrides (config/session_overrides.yaml); applied on top of the calendar.
     overrides: SessionOverridesConfig = SessionOverridesConfig()
+    # Authoritative exchange calendar (config/exchange_calendar.yaml); the loader requires the
+    # file. None only for unit tests that build a SessionsConfig by hand (weekday defaults apply).
+    calendar: ExchangeCalendarConfig | None = None
 
     @field_validator("timezone")
     @classmethod
@@ -318,6 +453,14 @@ class OutcomesSpec(StrictModel):
 class HistoricalSpec(StrictModel):
     warmup_bars: dict[Timeframe, int] = Field(default_factory=lambda: {Timeframe.M5: 600, Timeframe.M15: 300, Timeframe.H1: 200})
     max_days_per_request: int = Field(default=5, ge=1, le=90)
+    # Zero-trade fill: when the broker's M1 response verifiably spans an open-market minute
+    # (bars before AND after it inside the fetched range) but has no bar for it, treat it as a
+    # minute with no trades and insert a flat zero-volume bar. Dhan does not document this
+    # guarantee, so the safe default is False: the minute stays unresolved and the symbol
+    # untrusted until the broker returns it.
+    allow_verified_zero_trade_fill: bool = False
+    # Bounded retries for broker M1 verification / recovery before the symbol is marked ERROR.
+    verification_retries: int = Field(default=3, ge=1)
 
 
 class DiscordSpec(StrictModel):

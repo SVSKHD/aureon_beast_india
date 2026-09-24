@@ -59,6 +59,10 @@ historical:
     M15: 300
     H1: 200
   max_days_per_request: 5
+  # Missing broker M1 inside a fetched open-market range is NOT assumed to be a zero-trade
+  # minute unless this is true (Dhan gives no such guarantee). Default false: fail closed.
+  allow_verified_zero_trade_fill: false
+  verification_retries: 3
 
 discord:
   debounce_seconds: 5.0

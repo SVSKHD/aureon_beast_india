@@ -9,6 +9,7 @@ from aureon_mcx.detection.models import Detection, DetectionFamily, Direction
 from aureon_mcx.indicators.models import IndicatorRow, RsiDirection
 from aureon_mcx.market.candle import Candle
 from aureon_mcx.market.sessions import SessionCalendar
+from aureon_mcx.market.timeframe import Timeframe
 from aureon_mcx.outcomes import FEATURE_SCHEMA_VERSION, LABEL_VERSION, Horizon, OutcomeService, build_snapshot, cohort_stats, observe
 from aureon_mcx.outcomes.labels import FAKEOUT, GOOD_CONTINUATION, NO_FOLLOW_THROUGH, PENDING, WRONG_DIRECTION
 from aureon_mcx.outcomes.models import FeatureSnapshot
@@ -143,3 +144,32 @@ def test_outcome_service_end_to_end(repos, app_config):
     assert cohort_stats(obs, "12b", min_sample=30) is None
     stats = cohort_stats(obs, "12b", min_sample=1)
     assert stats.n == 1 and stats.continuation == 1 and "Historical cohort" in stats.lines()[0]
+
+
+def test_pending_outcomes_filter_by_contract_prevents_starvation(repos, app_config):
+    """500 pending GOLD snapshots must not hide SILVER's from a LIMIT 500 page."""
+    gold = repos.candles.insert_many(make_candles(500, tf=Timeframe.M5))
+    silver_start = datetime(2026, 9, 21, 3, 30, tzinfo=timezone.utc)
+    silver = repos.candles.insert_many(make_candles(20, start=silver_start, symbol="SILVER", security_id="431102",
+                                                     prices=[90000 + 20 * i for i in range(20)]))
+    with repos.db.transaction() as conn:
+        for c in gold + silver[:1]:
+            cur = conn.execute(
+                """INSERT INTO detections(candle_id, symbol, security_id, expiry_date, timeframe, open_time, family, kind, direction,
+                       price, label, payload_json, created_at) VALUES (?,?,?,?,?,?,'BREAKOUT','BREAKOUT','BULLISH',?,'x','{}',?)""",
+                (c.id, c.symbol, c.security_id, c.expiry_date, c.timeframe.value, c.open_time.isoformat(), c.close, "2026-01-01"),
+            )
+            conn.execute(
+                """INSERT INTO feature_snapshots(detection_id, candle_id, symbol, security_id, expiry_date, timeframe, open_time, direction,
+                       setup_family, reference_price, atr, feature_schema_version, features_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,'BULLISH','breakout',?,20.0,?,'{}',?)""",
+                (cur.lastrowid, c.id, c.symbol, c.security_id, c.expiry_date, c.timeframe.value, c.open_time.isoformat(), c.close,
+                 FEATURE_SCHEMA_VERSION, "2026-01-01"),
+            )
+    assert len(repos.snapshots.pending_outcomes(limit=500)) == 500
+    assert all(s.security_id == "428291" for s in repos.snapshots.pending_outcomes(limit=500))
+    silver_pending = repos.snapshots.pending_outcomes("431102", limit=500)
+    assert [s.security_id for s in silver_pending] == ["431102"]
+    svc = OutcomeService(repos, app_config.analysis, SessionCalendar(app_config.sessions))
+    assert svc.update_pending("431102", now=silver[-1].close_time) == 1
+    assert svc.observations_for_detection(silver_pending[0].detection_id)

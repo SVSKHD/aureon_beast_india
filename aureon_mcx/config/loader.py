@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from aureon_mcx.market.timeframe import Timeframe
 
 from .env import EnvSettings
-from .yaml_models import AnalysisConfig, ConfirmationPolicyConfig, SessionOverridesConfig, SessionsConfig, SymbolsConfig
+from .yaml_models import AnalysisConfig, ConfirmationPolicyConfig, ExchangeCalendarConfig, SessionOverridesConfig, SessionsConfig, SymbolsConfig
 
 
 class ConfigError(RuntimeError):
@@ -84,6 +84,11 @@ def load_config(config_dir: str | os.PathLike | None = None, env_file: str | os.
     if overrides_path.exists():
         overrides = _validate(SessionOverridesConfig, _read_yaml(overrides_path), overrides_path)
         sessions = sessions.model_copy(update={"overrides": overrides})
+    # The exchange calendar is mandatory: without it holidays and the seasonal 23:30 close would
+    # be treated as open market and missing candles would look like gaps (or worse, be trusted).
+    calendar_path = cdir / "exchange_calendar.yaml"
+    calendar = _validate(ExchangeCalendarConfig, _read_yaml(calendar_path), calendar_path)
+    sessions = sessions.model_copy(update={"calendar": calendar})
     policy = _validate(ConfirmationPolicyConfig, _read_yaml(cdir / "confirmation_policy.yaml"), cdir / "confirmation_policy.yaml")
     analysis_path = cdir / "analysis.yaml"
     analysis = _validate(AnalysisConfig, _read_yaml(analysis_path) if analysis_path.exists() else {}, analysis_path)

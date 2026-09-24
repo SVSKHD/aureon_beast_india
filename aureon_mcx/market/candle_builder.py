@@ -4,13 +4,20 @@ Analysis callbacks fire ONLY on COMPLETE closed candles, exactly once per bar pe
 timeframe, in chronological order. Ticks never reach analysis.
 
 Continuity rules
-  * a minute with no trades while the feed is connected and the exchange is open is
-    a legitimate flat M1 (last price, zero volume); a minute the feed was NOT
-    connected for is a data gap, never a flat bar;
+  * an M1 built from live ticks is TRUSTED only when trustworthy feed coverage existed
+    from the minute's very start (`coverage_start <= minute open`). A minute that began
+    before the connection (mid-minute connect / reconnect / rollover / feed restart) is
+    PARTIAL: it is never fed to aggregation, it is queued for broker verification and the
+    exact historical M1 replaces it;
+  * a connected socket does NOT prove coverage: an open-market minute that produced no
+    tick is a SILENT minute. It is never turned into a flat bar; it is queued for broker
+    verification (exact historical M1). Only an explicitly enabled, documented
+    zero-trade rule may fill it when the broker verifiably has no bar (see
+    `verify_m1`); by default the minute stays unresolved and the symbol untrusted;
   * an aggregated bar with missing constituents (GAP_DETECTED) is never dispatched;
     the pipeline records the gap, suspends dispatch (analytics for the symbol fail
     closed) and keeps later complete bars deferred until the gap is repaired with
-    the exact broker candle (`repair`) or the pipeline is explicitly reset;
+    the exact broker candle (`repair`);
   * during recovery (`recovering=True`) live ticks are buffered and replayed after
     the historical M1 candles have been fed, preserving chronological order.
 """
@@ -19,7 +26,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from .aggregation import AggregationResult, Completeness, TimeframeAggregator
 from .candle import Candle
@@ -30,6 +37,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from .sessions import SessionCalendar
 
 log = logging.getLogger("aureon.candles")
+
+REASON_PARTIAL = "partial_coverage"
+REASON_SILENT = "silent_feed"
 
 
 @dataclass(frozen=True)
@@ -57,7 +67,14 @@ class GapRecord:
         return self.resolved_at is not None
 
 
+class BuiltM1(NamedTuple):
+    candle: Candle
+    trusted: bool
+
+
 class M1CandleBuilder:
+    """Builds M1 bars from ticks and knows whether each bar had full coverage."""
+
     def __init__(self, symbol: str, security_id: str, expiry_date: str = "", tz=IST,
                  is_open: Callable[[datetime], bool] | None = None):
         self.symbol = symbol
@@ -72,15 +89,28 @@ class M1CandleBuilder:
         self._last_day_volume: float | None = None
         self._last_emitted: datetime | None = None
         self._last_close: float | None = None
-        self.connected_since: datetime | None = None  # flat-fill is allowed only from here on
+        self._bucket_trusted = False
+        self.coverage_start: datetime | None = None  # instant from which live coverage is trustworthy
         self.last_tick_at: datetime | None = None
 
-    # -- connection state -------------------------------------------------
+    # -- coverage state ---------------------------------------------------
     def set_connected(self, ts: datetime) -> None:
-        self.connected_since = ensure_utc(ts)
+        """Trustworthy coverage begins now. The minute containing `ts` is partial unless
+        `ts` is exactly its open."""
+        self.coverage_start = ensure_utc(ts)
+        if self._open_time is not None and self._open_time < self.coverage_start:
+            self._bucket_trusted = False
 
     def set_disconnected(self) -> None:
-        self.connected_since = None
+        self.coverage_start = None
+        self._bucket_trusted = False  # whatever is open lost its coverage
+
+    def minute_trusted(self, minute: datetime) -> bool:
+        return self.coverage_start is not None and self.coverage_start <= ensure_utc(minute)
+
+    @property
+    def open_minute(self) -> datetime | None:
+        return self._open_time
 
     @property
     def last_emitted(self) -> datetime | None:
@@ -93,52 +123,28 @@ class M1CandleBuilder:
             if self._open_time is not None and self._open_time <= ts:
                 self._open_time = None
 
-    def _emit(self) -> Candle:
+    def _emit(self) -> BuiltM1:
+        assert self._open_time is not None
         c = Candle(symbol=self.symbol, security_id=self.security_id, timeframe=Timeframe.M1, open_time=self._open_time,
                    open=self._o, high=self._h, low=self._l, close=self._c, volume=self._vol, open_interest=self._oi,
-                   source="dhan", is_closed=True, expiry_date=self.expiry_date)
+                   source="dhan" if self._bucket_trusted else "partial", is_closed=True, expiry_date=self.expiry_date)
         self._last_emitted = self._open_time
         self._last_close = self._c
         self._open_time = None
-        return c
+        return BuiltM1(c, self._bucket_trusted)
 
-    def _flat(self, minute: datetime) -> Candle:
-        assert self._last_close is not None
-        p = self._last_close
-        self._last_emitted = minute
-        return Candle(symbol=self.symbol, security_id=self.security_id, timeframe=Timeframe.M1, open_time=minute, open=p, high=p,
-                      low=p, close=p, volume=0.0, open_interest=self._oi, source="flat", is_closed=True, expiry_date=self.expiry_date)
-
-    def catch_up(self, until_minute: datetime) -> list[Candle]:
-        """Flat M1 bars for fully elapsed open-market minutes before `until_minute` that had no
-        ticks while the feed was continuously connected. Minutes outside a connected
-        period are left as gaps (they belong to reconnect recovery, never to flat fill)."""
-        out: list[Candle] = []
-        if self._last_emitted is None or self._last_close is None or self.connected_since is None or self._open_time is not None:
-            return out
-        minute = self._last_emitted + timedelta(minutes=1)
-        while minute < until_minute:
-            if minute < self.connected_since:
-                break  # not connected for that minute: a real gap
-            if self.is_open(minute):
-                out.append(self._flat(minute))
-            else:
-                self._last_emitted = minute  # closed market: nothing expected
-            minute += timedelta(minutes=1)
-        return out
-
-    def add_tick(self, tick: Tick) -> list[Candle]:
+    def add_tick(self, tick: Tick) -> list[BuiltM1]:
         ts = ensure_utc(tick.ts)
         self.last_tick_at = ts
         start = floor_to(ts, 60, self.tz)
         if self._last_emitted is not None and start <= self._last_emitted:
             return []  # late tick for a closed minute: ignore, never reopen
-        out: list[Candle] = []
+        out: list[BuiltM1] = []
         if self._open_time is not None and start > self._open_time:
             out.append(self._emit())
         if self._open_time is None:
-            out += self.catch_up(start)
             self._open_time = start
+            self._bucket_trusted = self.minute_trusted(start)
             self._o = self._h = self._l = self._c = tick.price
             self._vol = 0.0
             self._oi = None
@@ -155,13 +161,12 @@ class M1CandleBuilder:
             self._oi = tick.open_interest
         return out
 
-    def flush_at(self, now: datetime) -> list[Candle]:
+    def flush_at(self, now: datetime) -> list[BuiltM1]:
+        """Close the open minute once the wall clock passed its end. Never invents bars."""
         now = ensure_utc(now)
-        out: list[Candle] = []
         if self._open_time is not None and now >= self._open_time + timedelta(seconds=60):
-            out.append(self._emit())
-        out += self.catch_up(floor_to(now, 60, self.tz))
-        return out
+            return [self._emit()]
+        return []
 
     @property
     def partial(self) -> Candle | None:
@@ -174,6 +179,7 @@ class M1CandleBuilder:
 
 ClosedHandler = Callable[[Candle], None]
 GapHandler = Callable[[GapRecord], None]
+PendingHandler = Callable[[datetime, str], None]
 
 
 class CandlePipeline:
@@ -185,7 +191,7 @@ class CandlePipeline:
 
     def __init__(self, symbol: str, security_id: str, expiry_date: str, primary: Timeframe, timeframes: list[Timeframe],
                  on_closed: ClosedHandler, tz=IST, calendar: "SessionCalendar | None" = None, on_gap: GapHandler | None = None,
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None, on_pending: PendingHandler | None = None):
         if primary == Timeframe.M1:
             raise ValueError("primary timeframe must be above M1")
         self.symbol = symbol
@@ -195,9 +201,12 @@ class CandlePipeline:
         self.timeframes = [t for t in timeframes if t != Timeframe.M1]
         self.on_closed = on_closed
         self.on_gap = on_gap or (lambda g: None)
+        self.on_pending = on_pending or (lambda m, r: None)
         self.calendar = calendar
+        self.tz = tz
         self._clock = clock or utc_now
         is_open = calendar.is_open if calendar is not None else None
+        self.is_open = is_open or (lambda ts: True)
         self.m1 = M1CandleBuilder(symbol, security_id, expiry_date, tz, is_open)
         self.primary_agg = TimeframeAggregator(Timeframe.M1, primary, symbol, security_id, expiry_date, tz, calendar=calendar)
         self.higher: dict[Timeframe, TimeframeAggregator] = {}
@@ -218,6 +227,9 @@ class CandlePipeline:
         self._deferred: list[Candle] = []
         self._tick_buffer: list[Tick] = []
         self._seen_m1: set[datetime] = set()
+        # minutes whose live coverage is not trustworthy (partial / silent): verified against the broker
+        self.pending_verification: dict[datetime, str] = {}
+        self.verified_minutes: int = 0
 
     # ----------------------------------------------------------- properties
     @property
@@ -226,7 +238,10 @@ class CandlePipeline:
 
     @property
     def continuity_ok(self) -> bool:
-        return not self.suspended and not self.unresolved_gaps
+        return not self.suspended and not self.unresolved_gaps and not self.pending_verification
+
+    def pending_minutes(self) -> list[datetime]:
+        return sorted(self.pending_verification)
 
     @property
     def last_m1_close(self) -> datetime | None:
@@ -239,14 +254,37 @@ class CandlePipeline:
     def set_disconnected(self) -> None:
         self.m1.set_disconnected()
 
+    @property
+    def coverage_start(self) -> datetime | None:
+        return self.m1.coverage_start
+
+    def current_minute_partial(self, now: datetime) -> datetime | None:
+        """Return the minute in progress when it began before tick coverage did.
+
+        A minute whose start precedes ``coverage_start`` can never be trusted from
+        ticks, whether or not a tick has arrived yet: it must be replaced by the
+        broker's M1 once it closes.  ``None`` means the current minute (if any)
+        is fully covered or already verified.
+        """
+        cs = self.coverage_start
+        if cs is None:
+            return None
+        cur = floor_to(ensure_utc(now), 60)
+        if cs <= cur or floor_to(cs, 60) != cur:
+            return None
+        if cur in self._seen_m1:
+            return None
+        return cur
+
     # ------------------------------------------------------------ dispatch
     def _handle(self, res: AggregationResult) -> None:
-        if res.status is Completeness.GAP_DETECTED:
-            gap = GapRecord(res.candle.timeframe, res.candle.open_time, res.expected, res.present, res.missing, self._clock())
+        if res.status is Completeness.GAP_DETECTED or res.candle is None:
+            assert res.timeframe is not None and res.open_time is not None
+            gap = GapRecord(res.timeframe, res.open_time, res.expected, res.present, res.missing, self._clock())
             self.gaps.append(gap)
             self.suspended = True
-            log.error("market_data_gap symbol=%s tf=%s open_time=%s expected=%d present=%d", self.symbol, res.candle.timeframe.value,
-                      res.candle.open_time.isoformat(), res.expected, res.present)
+            log.error("market_data_gap symbol=%s tf=%s open_time=%s expected=%d present=%d", self.symbol, res.timeframe.value,
+                      res.open_time.isoformat(), res.expected, res.present)
             self.on_gap(gap)
             return
         if self.suspended:
@@ -279,22 +317,64 @@ class CandlePipeline:
             if agg.source == Timeframe.M1:
                 for res in agg.add(m1):
                     self._handle(res)
-        for res in self.primary_agg.add(m1):
+        results = self.primary_agg.add(m1)
+        for res in results:
             self._handle(res)
+        if not results:
+            rebuilt = self.primary_agg.try_complete_gap(m1)  # late verified minute completing a GAP bucket
+            if rebuilt is not None:
+                self.repair(rebuilt)
+
+    def _mark_pending(self, minute: datetime, reason: str) -> None:
+        if minute in self._seen_m1 or minute in self.pending_verification:
+            return
+        self.pending_verification[minute] = reason
+        log.warning("m1_needs_verification symbol=%s minute=%s reason=%s", self.symbol, minute.isoformat(), reason)
+        self.on_pending(minute, reason)
+
+    def _on_built(self, built: BuiltM1) -> None:
+        if built.trusted:
+            self.on_m1_closed(built.candle)
+        else:
+            self._mark_pending(built.candle.open_time, REASON_PARTIAL)
 
     def add_tick(self, tick: Tick) -> None:
         if self.recovering:
             self._tick_buffer.append(tick)
             return
-        for m1 in self.m1.add_tick(tick):
-            self.on_m1_closed(m1)
+        for built in self.m1.add_tick(tick):
+            self._on_built(built)
+
+    def detect_silent_minutes(self, now: datetime) -> list[datetime]:
+        """Open-market minutes that fully elapsed while coverage was supposedly trustworthy but
+        produced no M1 (no tick at all). They are queued for broker verification, never
+        synthesised. Minutes before `coverage_start` belong to reconnect recovery."""
+        cs = self.m1.coverage_start
+        if cs is None:
+            return []
+        now = ensure_utc(now)
+        current_minute = floor_to(now, 60, self.tz)
+        first = floor_to(cs, 60, self.tz)
+        if self.last_m1_open is not None and self.last_m1_open + timedelta(minutes=1) > first:
+            first = self.last_m1_open + timedelta(minutes=1)
+        found: list[datetime] = []
+        m = first
+        while m < current_minute:
+            if m not in self._seen_m1 and m not in self.pending_verification and m != self.m1.open_minute and self.is_open(m):
+                reason = REASON_PARTIAL if cs > m else REASON_SILENT
+                self._mark_pending(m, reason)
+                found.append(m)
+            m += timedelta(minutes=1)
+        return found
 
     def flush_at(self, now: datetime) -> None:
-        """Wall-clock boundary check: closes bars whose boundary passed with no new tick."""
+        """Wall-clock boundary check: closes bars whose boundary passed with no new tick and
+        queues silent minutes for verification."""
         if self.recovering:
             return
-        for m1 in self.m1.flush_at(now):
-            self.on_m1_closed(m1)
+        for built in self.m1.flush_at(now):
+            self._on_built(built)
+        self.detect_silent_minutes(now)
         res = self.primary_agg.flush_at(now)
         if res is not None:
             self._handle(res)
@@ -315,6 +395,41 @@ class CandlePipeline:
     def begin_recovery(self) -> None:
         self.recovering = True
 
+    def verify_m1(self, candles: list[Candle], now: datetime, allow_zero_trade_fill: bool = False,
+                  fetched_range: tuple[datetime, datetime] | None = None) -> tuple[list[datetime], list[datetime]]:
+        """Resolve pending minutes with exact broker M1 candles. Returns (verified, still_pending).
+
+        A minute with no broker bar stays pending unless `allow_zero_trade_fill` is on AND the
+        broker response verifiably spans that minute (bars exist both before and after it inside
+        the fetched range). That rule is documented in config: it treats a missing bar strictly
+        inside a returned range as a zero-trade minute. It is OFF by default (fail closed)."""
+        now = ensure_utc(now)
+        by_time = {c.open_time: c for c in candles if c.is_closed and c.timeframe is Timeframe.M1}
+        verified: list[datetime] = []
+        for minute in self.pending_minutes():
+            if minute + timedelta(minutes=1) > now:
+                continue  # still open: cannot be verified yet
+            candle = by_time.get(minute)
+            if candle is None and allow_zero_trade_fill and by_time:
+                before = [t for t in by_time if t < minute]
+                after = [t for t in by_time if t > minute]
+                inside = fetched_range is not None and fetched_range[0] <= minute < fetched_range[1]
+                if before and after and inside:
+                    p = by_time[max(before)].close
+                    candle = Candle(symbol=self.symbol, security_id=self.security_id, timeframe=Timeframe.M1, open_time=minute, open=p,
+                                    high=p, low=p, close=p, volume=0.0, open_interest=by_time[max(before)].open_interest,
+                                    source="zero_trade_verified", is_closed=True, expiry_date=self.expiry_date)
+                    log.warning("m1_zero_trade_fill symbol=%s minute=%s", self.symbol, minute.isoformat())
+            if candle is None:
+                continue
+            self.pending_verification.pop(minute, None)
+            self.m1.mark_emitted_until(minute)
+            self.m1._last_close = candle.close
+            self.on_m1_closed(candle)
+            self.verified_minutes += 1
+            verified.append(minute)
+        return verified, self.pending_minutes()
+
     def recover_m1(self, candles: list[Candle]) -> int:
         """Feed historical CLOSED M1 candles (chronological) to fill a data gap. Minutes already
         processed are skipped; the M1 builder is advanced so late ticks for them are ignored."""
@@ -328,6 +443,7 @@ class CandlePipeline:
                 self.m1._open_time = None  # partially observed minute: the broker candle replaces it
             self.m1.mark_emitted_until(c.open_time)
             self.m1._last_close = c.close
+            self.pending_verification.pop(c.open_time, None)
             self.on_m1_closed(c)
             fed += 1
         return fed
