@@ -1,0 +1,16 @@
+# INITIAL STRICT RESEARCH POLICY.
+# These rules are a research starting point. They are NOT claimed to be profitable.
+# Every clearance result stores `policy_version` so results remain auditable.
+policy_version: "strict-research-v1"
+
+rsi_threshold: 50.0
+
+rules:
+  require_lifecycle_confirmed: true      # lifecycle == CONFIRMED
+  require_ema_alignment: true            # EMA20 vs EMA50 agrees with direction
+  require_rsi_side: true                 # RSI on the directional side of 50
+  require_present_trend: true            # present trend == setup direction
+  require_mtf_alignment: true            # available directional MTF reads agree
+  require_higher_tf_context: true        # at least one directional higher timeframe
+  require_structure_not_opposing: true   # structure must not be the opposite regime
+  block_on_fakeout_risk: true            # FAKEOUT_RISK lifecycle blocks clearance

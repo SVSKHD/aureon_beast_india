@@ -1,0 +1,36 @@
+# Aureon MCX - session definitions. All times are wall-clock in `timezone`.
+# MCX hours change with US DST, so nothing here is hard-coded in code.
+timezone: Asia/Kolkata
+
+# Exchange trading day window (used for previous-day high/low frames).
+trading_day:
+  start: "09:00"
+  end: "23:30"
+
+# Global session context windows (IST). Used for ASIA / LONDON / NEW YORK trend rows.
+sessions:
+  - name: ASIA
+    start: "09:00"
+    end: "13:30"
+  - name: LONDON
+    start: "13:30"
+    end: "18:30"
+  - name: NEW_YORK
+    start: "18:30"
+    end: "23:30"
+
+# MCX local session context (shown alongside the global sessions).
+mcx_sessions:
+  - name: MORNING
+    start: "09:00"
+    end: "17:00"
+  - name: EVENING
+    start: "17:00"
+    end: "23:30"
+
+# Present / session trend evaluation.
+trend:
+  # Net move (last close vs reference) must exceed this many ATRs to be directional.
+  min_move_atr: 0.25
+  # Present-trend lookback in closed primary-timeframe bars.
+  present_lookback_bars: 6
