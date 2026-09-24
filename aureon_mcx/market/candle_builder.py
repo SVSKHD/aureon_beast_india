@@ -258,6 +258,24 @@ class CandlePipeline:
     def coverage_start(self) -> datetime | None:
         return self.m1.coverage_start
 
+    def current_minute_partial(self, now: datetime) -> datetime | None:
+        """Return the minute in progress when it began before tick coverage did.
+
+        A minute whose start precedes ``coverage_start`` can never be trusted from
+        ticks, whether or not a tick has arrived yet: it must be replaced by the
+        broker's M1 once it closes.  ``None`` means the current minute (if any)
+        is fully covered or already verified.
+        """
+        cs = self.coverage_start
+        if cs is None:
+            return None
+        cur = floor_to(ensure_utc(now), 60)
+        if cs <= cur or floor_to(cs, 60) != cur:
+            return None
+        if cur in self._seen_m1:
+            return None
+        return cur
+
     # ------------------------------------------------------------ dispatch
     def _handle(self, res: AggregationResult) -> None:
         if res.status is Completeness.GAP_DETECTED:

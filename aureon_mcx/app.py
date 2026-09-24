@@ -101,6 +101,7 @@ class Application:
         self.health = HealthState()
         self.sink: PresentationSink = NullSink()
         self.runtimes: dict[str, SymbolRuntime] = {}
+        self.pending_runtimes: dict[str, SymbolRuntime] = {}  # security_id -> runtime prepared for rollover
         self.historical = None
         self.continuity: ContinuityService | None = None
         self.feed = None
@@ -141,7 +142,10 @@ class Application:
         return {r.contract.security_id: r.pipeline for r in self.runtimes.values() if r.pipeline is not None}
 
     def _runtime_for_security(self, security_id: str) -> SymbolRuntime | None:
-        return next((r for r in self.runtimes.values() if r.contract.security_id == security_id), None)
+        rt = next((r for r in self.runtimes.values() if r.contract.security_id == security_id), None)
+        if rt is None:
+            rt = self.pending_runtimes.get(security_id)  # new contract being rolled in: never drop its ticks
+        return rt
 
     # ------------------------------------------------------------------ steps
     def _step(self, n: int, text: str) -> None:
@@ -384,6 +388,13 @@ class Application:
         pending = p.pending_minutes()
         closed_pending = [m for m in pending if m + timedelta(minutes=1) <= self._now()]
         if recovered and p.continuity_ok:
+            partial = p.current_minute_partial(self._now())
+            if partial is not None:
+                # the minute in progress began before coverage did (mid-minute connect,
+                # reconnect or rollover): its trust is unknown until the broker M1 replaces it
+                self.health.set_symbol_state(sym, "RECOVERING_GAP", f"current minute {partial.isoformat()} is partial; "
+                                             "awaiting broker verification", unresolved_gaps=0)
+                return False
             self.health.set_symbol_state(sym, "LIVE", "continuity verified", unresolved_gaps=0)
             return True
         if recovered and not gaps and pending and not closed_pending:
@@ -612,22 +623,43 @@ class Application:
             log.error("rollover_not_warm %s", kv(logical=sym, new_security_id=new.security_id))
             self.health.set_symbol_state(sym, "LIVE", f"rollover to {new.security_id} aborted: indicators not warm", security_id=old.security_id)
             return False
-        # subscribe the new contract first, then switch atomically, then drop the old one
-        if self.feed is not None:
-            await self.feed.subscribe([new.security_id])
-        self.repos.instruments.upsert_active(new.as_row())
-        if self.feed is not None and getattr(self.feed, "connected", False):
+        # Race-safe handover: the prepared runtime is registered under its security id BEFORE
+        # subscribing, so a tick that arrives inside subscribe() is routed into its pipeline
+        # instead of being discarded. Coverage starts now (the current minute is partial and
+        # will be broker-verified like any other partial minute).
+        feed_connected = bool(getattr(self.feed, "connected", False))
+        if feed_connected:
             new_rt.pipeline.set_connected(self._now())
-        self.runtimes[sym] = new_rt
+        self.pending_runtimes[new.security_id] = new_rt
+        try:
+            if self.feed is not None:
+                await self.feed.subscribe([new.security_id])
+        except Exception as exc:  # noqa: BLE001
+            self.pending_runtimes.pop(new.security_id, None)
+            log.error("rollover_subscribe_failed %s", kv(logical=sym, new_security_id=new.security_id, error=type(exc).__name__))
+            self.health.set_symbol_state(sym, "LIVE" if old_rt.pipeline is not None and old_rt.pipeline.continuity_ok else "ERROR",
+                                         f"rollover to {new.security_id} failed at subscribe; old contract retained",
+                                         security_id=old.security_id, expiry=old.expiry_iso)
+            return False
+        self.repos.instruments.upsert_active(new.as_row())
+        self.runtimes[sym] = new_rt          # atomic switch of observer / history / pipeline / contract
+        self.pending_runtimes.pop(new.security_id, None)
         if self.feed is not None:
             await self.feed.unsubscribe([old.security_id])
-        self.health.set_symbol_state(sym, "LIVE", f"rolled from {old.security_id}", security_id=new.security_id, expiry=new.expiry_iso,
-                                     unresolved_gaps=0)
-        log.warning("rollover_complete %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso))
-        self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso}")
-        if getattr(self.feed, "connected", False):
-            self._spawn(self.recover(sym), name=f"recovery:{sym}")
-        return True
+        # NOT LIVE yet: continuity between the new contract's history and its live stream is unverified.
+        self.health.set_symbol_state(sym, "RECOVERING_GAP", f"rolled from {old.security_id}; verifying live continuity",
+                                     security_id=new.security_id, expiry=new.expiry_iso, unresolved_gaps=0, feed_connected=feed_connected)
+        log.warning("rollover_switched %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso))
+        self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso} (verifying continuity)")
+        if feed_connected:
+            ok = await self.recover(sym)
+        else:
+            ok = False
+            self.health.set_symbol_state(sym, "RECOVERING_GAP", "feed disconnected; continuity recovery runs on reconnect",
+                                         security_id=new.security_id, expiry=new.expiry_iso)
+        log.warning("rollover_complete %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso,
+                                                 state=self.health.symbol(sym).state))
+        return ok
 
     # --------------------------------------------------------------- shutdown
     async def shutdown(self) -> None:

@@ -406,6 +406,107 @@ def test_rollover_is_staged_and_warm(tmp_path, monkeypatch):
     assert any("rolled -> security_id 431102" in s for s in app.sink.statuses)
 
 
+def _record_states(app):
+    states = []
+    orig = app.health.set_symbol_state
+
+    def rec(sym, state, detail="", **fields):
+        states.append(state)
+        return orig(sym, state, detail, **fields)
+
+    app.health.set_symbol_state = rec
+    return states
+
+
+def test_rollover_state_progression_never_live_before_recovery(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    states = _record_states(app)
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        app.health.set_symbol_state("GOLD", "LIVE")
+        states.clear()
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+
+    asyncio.run(go())
+    assert states[0] == "ROLLOVER_WARMING"
+    assert "RECOVERING_GAP" in states and states[-1] == "LIVE"
+    assert states.index("RECOVERING_GAP") < states.index("LIVE")
+    assert "LIVE" not in states[: states.index("RECOVERING_GAP")]  # never ROLLOVER_WARMING -> LIVE -> RECOVERING
+
+
+def test_rollover_keeps_recovering_when_current_minute_is_partial(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    clock[0] = NOW + timedelta(seconds=30)  # rollover happens half way through a minute
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+        # a tick in the partial minute, then the minute closes
+        app._on_tick(Tick("431102", 71000.0, NOW + timedelta(seconds=35), last_qty=1))
+        assert app.health.symbols["GOLD"].state == "RECOVERING_GAP"
+        clock[0] = NOW + timedelta(minutes=1, seconds=2)
+        app._on_tick(Tick("431102", 71001.0, NOW + timedelta(minutes=1, seconds=1), last_qty=1))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if app.health.symbols["GOLD"].state == "LIVE":
+                break
+
+    asyncio.run(go())
+    p = app.pipelines["431102"]
+    assert NOW not in p.pending_verification and app.health.symbols["GOLD"].state == "LIVE"
+    assert [c for c in hist.calls if c[1] == "431102" and c[2] is Timeframe.M1], "partial minute verified against broker M1"
+    assert p.last_m1_open == NOW and p.m1._last_close == m1_for("431102", NOW, NOW + timedelta(minutes=1))[0].close
+
+
+def test_rollover_ticks_during_subscribe_are_not_lost(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+    injected = []
+
+    async def go():
+        feed = _prepare_rollover(app, clock)
+        await feed.subscribe(["428291"])
+        app._build_pipelines()
+        orig_sub = feed.subscribe
+
+        async def subscribe(ids):
+            await orig_sub(ids)
+            if "431102" in ids:
+                # the broker starts streaming immediately: five full minutes + the first tick of the next one
+                for c in m1_for("431102", NOW, NOW + timedelta(minutes=5)):
+                    for t in ticks_for(c):
+                        clock[0] = t.ts
+                        injected.append(t)
+                        app._on_tick(t)
+                t = Tick("431102", 71000.0, NOW + timedelta(minutes=5, seconds=1), last_qty=0.0)
+                clock[0] = t.ts
+                injected.append(t)
+                app._on_tick(t)
+
+        feed.subscribe = subscribe
+        app.resolver._today = lambda: datetime(2026, 10, 3).date()
+        await app.check_rollover()
+
+    asyncio.run(go())
+    assert app.contracts["GOLD"].security_id == "431102" and injected
+    p = app.pipelines["431102"]
+    assert p.last_m1_open == NOW + timedelta(minutes=5) or p.m1.open_minute == NOW + timedelta(minutes=5)
+    ref = aggregate_closed(m1_for("431102", NOW, NOW + timedelta(minutes=5)), Timeframe.M5)[0]
+    live = [c for c in app.observers["GOLD"].candles[Timeframe.M5] if c.open_time >= NOW]
+    assert len(live) == 1 and (live[0].open, live[0].high, live[0].low, live[0].close, live[0].volume) == (ref.open, ref.high, ref.low, ref.close, ref.volume)
+    assert app.health.symbols["GOLD"].state == "LIVE" and app.health.symbols["GOLD"].last_tick_at == injected[-1].ts
+    assert not app.pending_runtimes
+
+
 def test_rollover_failure_keeps_old_contract(tmp_path, monkeypatch):
     app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
     app.startup()
