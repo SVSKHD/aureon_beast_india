@@ -101,9 +101,12 @@ class StructureEngine:
             w = list(self._window)
             cand = w[s]
             left, right = w[:s], w[s + 1:]
-            if all(cand.high > c.high for c in left) and all(cand.high > c.high for c in right):
+            # DECISION: strictly greater than the left side, greater-or-equal on the
+            # right, so a flat top/bottom of equal bars yields exactly one pivot
+            # (the first bar) instead of none.
+            if all(cand.high > c.high for c in left) and all(cand.high >= c.high for c in right):
                 confirmed.append(self._make(cand, candle, PivotKind.HIGH, cand.high, atr))
-            if all(cand.low < c.low for c in left) and all(cand.low < c.low for c in right):
+            if all(cand.low < c.low for c in left) and all(cand.low <= c.low for c in right):
                 confirmed.append(self._make(cand, candle, PivotKind.LOW, cand.low, atr))
         for p in confirmed:
             (self.highs if p.kind is PivotKind.HIGH else self.lows).append(p)
