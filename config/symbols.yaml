@@ -1,0 +1,23 @@
+# Aureon MCX - logical symbol -> MCX futures contract resolution.
+# Security IDs are NEVER hard-coded. The SymbolResolver derives the active
+# contract from Dhan's instrument master using these rules.
+instrument_master:
+  # Dhan detailed scrip master (CSV). Cached locally, refreshed on startup and daily.
+  url: "https://images.dhan.co/api-scrip/api-scrip-master-detailed.csv"
+  cache_path: "data/cache/instrument_master.csv"
+  refresh_hours: 24
+
+# Number of days before expiry at which the NEXT contract becomes the active one.
+rollover_days_before_expiry: 3
+
+symbols:
+  GOLD:
+    underlying: GOLD
+    exchange_segment: MCX_COMM
+    instrument_type: FUTCOM
+    contract_policy: nearest_liquid
+  SILVER:
+    underlying: SILVER
+    exchange_segment: MCX_COMM
+    instrument_type: FUTCOM
+    contract_policy: nearest_liquid
