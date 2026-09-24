@@ -157,3 +157,22 @@ def test_replace_subscription_on_rollover():
     assert [m["RequestCode"] for m in sent] == [18, 17]
     assert sent[0]["InstrumentList"][0]["SecurityId"] == "428291" and sent[1]["InstrumentList"][0]["SecurityId"] == "431102"
     assert feed._subscribed == {"431102"}
+
+
+def test_header_declared_length_must_match_response_type():
+    # each known response code implies one layout; a header that declares another length is rejected
+    assert parse_packet(_header(CODE_TICKER, 50, 5, 1) + struct.pack("<fI", 1.0, 1) + b"\x00" * 34) is None
+    assert parse_packet(_header(CODE_QUOTE, 16, 5, 1) + struct.pack("<fI", 1.0, 1)) is None
+    full = full_packet(1, 1.0, 1, 1, 1.0, 1, 1, 1, 1, 1, 1, 1.0, 1.0, 1.0, 1.0, [(0, 0, 0, 0, 0.0, 0.0)] * 5)
+    assert parse_packet(_header(CODE_FULL, 50, 5, 1) + full[8:]) is None
+    assert parse_packet(_header(CODE_OI, 16, 5, 1) + struct.pack("<fI", 1.0, 1)) is None  # OI packet is 12, not 16
+    assert parse_packet(_header(CODE_MARKET_STATUS, 16, 5, 1) + b"\x00" * 8) is None
+    # the declared length must also fit inside the buffer, and never be shorter than the header
+    assert parse_packet(_header(CODE_TICKER, 16, 5, 1) + struct.pack("<f", 1.0)) is None
+    assert parse_packet(_header(99, 4, 5, 1)) is None
+    assert parse_packet(_header(99, 40, 5, 1) + b"\x00" * 8) is None
+    # well-formed packets still parse, and trailing bytes after a correct declared length are tolerated
+    assert parse_packet(ticker_packet(428291, 70125.0, 1789962600)).ltp == pytest.approx(70125.0)
+    assert parse_packet(ticker_packet(428291, 70125.0, 1789962600) + b"\x00" * 4).ltt == 1789962600
+    unknown = parse_packet(_header(99, 12, 5, 7) + b"\x00" * 4)
+    assert unknown is not None and unknown.code == 99 and unknown.security_id == "7"

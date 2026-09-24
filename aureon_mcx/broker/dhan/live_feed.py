@@ -102,11 +102,17 @@ def parse_packet(data: bytes) -> FeedPacket | None:
     """Parse one binary feed packet. Returns None for truncated / unknown packets."""
     if len(data) < HEADER.size:
         return None
-    code, _length, segment, sec_id = HEADER.unpack_from(data, 0)
+    code, declared, segment, sec_id = HEADER.unpack_from(data, 0)
     sid = str(sec_id)
     required = PACKET_SIZES.get(code)
-    if required is not None and len(data) < required:
-        log.warning("feed_packet_truncated %s", kv(code=code, security_id=sid, length=len(data), required=required))
+    if required is not None and declared != required:
+        # The header's message length must agree with the layout the response code implies.
+        # A mismatch means a layout change (or corruption): decoding the wrong offsets would
+        # produce plausible-looking but wrong prices, so the packet is rejected instead.
+        log.warning("feed_packet_length_mismatch %s", kv(code=code, security_id=sid, declared=declared, required=required, length=len(data)))
+        return None
+    if declared < HEADER.size or len(data) < declared:
+        log.warning("feed_packet_truncated %s", kv(code=code, security_id=sid, length=len(data), declared=declared))
         return None
     if code == CODE_TICKER:
         ltp, ltt = TICKER.unpack_from(data, 8)

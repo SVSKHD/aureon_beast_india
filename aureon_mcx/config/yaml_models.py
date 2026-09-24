@@ -309,6 +309,16 @@ class ExchangeCalendarConfig(StrictModel):
         for p in self.close_periods:
             if parse_hhmm(p.end) <= parse_hhmm(self.default_session.evening_start):
                 raise ValueError(f"exchange calendar: close period end {p.end} must be after evening_start")
+        # An unpopulated calendar would silently treat every holiday as an open market day and
+        # every DST-season evening as open until 23:55: refuse it instead of guessing.
+        if not self.holidays:
+            raise ValueError("exchange calendar: no holidays listed; populate it from the MCX circular")
+        if self.year is None:
+            raise ValueError("exchange calendar: 'year' is required")
+        all_dates = dates + specials + [p.from_date for p in self.close_periods] + [p.to_date for p in self.close_periods]
+        wrong_year = [d for d in all_dates if not str(d).startswith(f"{self.year}-")]
+        if wrong_year:
+            raise ValueError(f"exchange calendar: dates outside year {self.year}: {', '.join(str(d) for d in wrong_year[:5])}")
         return self
 
 
@@ -320,8 +330,8 @@ class SessionsConfig(StrictModel):
     trend: TrendSpec = TrendSpec()
     # Legacy date overrides (config/session_overrides.yaml); applied on top of the calendar.
     overrides: SessionOverridesConfig = SessionOverridesConfig()
-    # Authoritative exchange calendar (config/exchange_calendar.yaml). When absent, the
-    # trading_day defaults above apply to every weekday.
+    # Authoritative exchange calendar (config/exchange_calendar.yaml); the loader requires the
+    # file. None only for unit tests that build a SessionsConfig by hand (weekday defaults apply).
     calendar: ExchangeCalendarConfig | None = None
 
     @field_validator("timezone")

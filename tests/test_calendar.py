@@ -142,9 +142,17 @@ def test_malformed_calendar_fails_loudly(tmp_path):
         'holidays:\n  - { date: "2026-01-26", name: "a", closed: full }\n  - { date: "2026-01-26", name: "b", closed: full }\n',
         'unknown_key: 1\n',
     ]
+    bad_cases += [
+        'year: 2026\nholidays: []\n',  # unpopulated
+        'holidays:\n  - { date: "2026-01-26", name: "x", closed: full }\n',  # no year
+        'year: 2026\nholidays:\n  - { date: "2025-01-26", name: "x", closed: full }\n',  # wrong year
+    ]
     for body in bad_cases:
         (cdir / "exchange_calendar.yaml").write_text(body)
         with pytest.raises(ConfigError):
             load_config(config_dir=cdir, env_file=tmp_path / "none.env")
+    (cdir / "exchange_calendar.yaml").unlink()
+    with pytest.raises(ConfigError, match="missing config file"):  # the calendar is mandatory
+        load_config(config_dir=cdir, env_file=tmp_path / "none.env")
     with pytest.raises(Exception):
         ExchangeCalendarConfig.model_validate({"close_periods": [{"from": "2026-03-09", "to": "2026-11-01", "end": "16:00"}]})

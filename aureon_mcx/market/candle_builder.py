@@ -278,12 +278,13 @@ class CandlePipeline:
 
     # ------------------------------------------------------------ dispatch
     def _handle(self, res: AggregationResult) -> None:
-        if res.status is Completeness.GAP_DETECTED:
-            gap = GapRecord(res.candle.timeframe, res.candle.open_time, res.expected, res.present, res.missing, self._clock())
+        if res.status is Completeness.GAP_DETECTED or res.candle is None:
+            assert res.timeframe is not None and res.open_time is not None
+            gap = GapRecord(res.timeframe, res.open_time, res.expected, res.present, res.missing, self._clock())
             self.gaps.append(gap)
             self.suspended = True
-            log.error("market_data_gap symbol=%s tf=%s open_time=%s expected=%d present=%d", self.symbol, res.candle.timeframe.value,
-                      res.candle.open_time.isoformat(), res.expected, res.present)
+            log.error("market_data_gap symbol=%s tf=%s open_time=%s expected=%d present=%d", self.symbol, res.timeframe.value,
+                      res.open_time.isoformat(), res.expected, res.present)
             self.on_gap(gap)
             return
         if self.suspended:

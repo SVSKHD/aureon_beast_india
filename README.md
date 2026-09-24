@@ -111,29 +111,52 @@ Aureon never analyses an incomplete or discontinuous candle stream.
   is `GAP_DETECTED`: it is never dispatched to the observer, the gap is recorded
   (`market_data_gaps`), the symbol goes to `ERROR` and later complete bars are held back until
   the gap is repaired with the exact broker candle.
-* **Quiet minutes.** While the feed is connected and the exchange is open, a minute without
-  trades becomes a flat M1 (last price, zero volume). Minutes during a disconnect are never
-  invented: they are gaps.
-* **Reconnect recovery.** On every WebSocket connect (startup included, so starting at 10:02
-  is handled) the closed M1 candles between the last processed minute (or the minute left open
-  at disconnect) and now are fetched from the Dhan historical API and fed through the same
-  pipeline in chronological order while live ticks are buffered, then buffered ticks are
-  replayed. The symbol is `LIVE` only when continuity is restored; a failed recovery leaves
-  it in `ERROR` with analytics suspended.
-* **Exchange calendar.** `config/sessions.yaml` plus the optional
-  `config/session_overrides.yaml` (holidays, closed days, special sessions with their own
-  start/end) drive `SessionCalendar`, the single source for "is the exchange open", trading
-  date, session end and H4 buckets.
+* **M1 trust.** A live M1 is trusted only when tick coverage began at or before the minute's
+  start (`coverage_start`, set on every connect / reconnect / rollover). A minute that began
+  before coverage (startup at 10:02:30, a reconnect, a feed restart) and a minute in which a
+  connected socket delivered no tick (`silent_feed`) are never analysed from ticks: they are
+  queued for verification and replaced by the exact broker M1 (Dhan intraday, interval 1). A
+  connected socket is not evidence that nothing traded. Until the broker candle arrives the
+  symbol is `RECOVERING_GAP` (or `STALE` for silent minutes) and the M5 bucket that contains
+  the minute is completed only from verified constituents (a `GAP_DETECTED` bucket is rebuilt
+  once its late constituents are verified). If the broker has no candle for an open-market
+  minute the symbol stays in `ERROR`; a zero-trade flat fill is possible only with
+  `historical.allow_verified_zero_trade_fill: true` (default `false`) and only when the broker
+  returned the neighbouring minutes. Minutes during a disconnect are gaps, never invented.
+* **Reconnect recovery.** On every WebSocket connect (startup included) the closed M1 candles
+  between the last processed minute (or the minute left open at disconnect) and now are fetched
+  from the Dhan historical API and fed through the same pipeline in chronological order while
+  live ticks are buffered, then buffered ticks are replayed. The symbol is `LIVE` only when
+  continuity is verified; a failed recovery leaves it in `ERROR` with analytics suspended.
+* **Exchange calendar.** `config/exchange_calendar.yaml` is the authoritative MCX calendar
+  (year, full holidays, morning-closed days that open at 17:00, seasonal close periods for the
+  23:30 IST US-daylight-time close vs 23:55 otherwise, special sessions). `config/sessions.yaml`
+  gives the default session shape; the optional legacy `config/session_overrides.yaml` still
+  applies first. `SessionCalendar` resolves override → special session → holiday → weekend →
+  close period → default, and is the single source for "is the exchange open", trading date,
+  session end, expected constituents and H4 buckets. The file records its SOURCE and
+  `verified_against_official_circular`; a missing, malformed or unpopulated calendar fails startup.
+* **Historical cache.** `historical_cache_ranges` stores *verified* coverage: intervals whose
+  calendar-expected bars were all returned by the broker (merged on write). A partial, empty or
+  truncated response leaves the missing sub-range uncovered and only that sub-range is
+  re-requested next time; an unclosed bar is never covered; a holiday range is verified-empty.
+* **Off-session prints.** A source bar inside a bucket but outside market hours is logged as
+  `aggregation_extra_ignored` and never shapes the OHLC / volume / OI of a trusted bar.
 * **H4 policy.** H4 bars are anchored to the configured trading-day start (09:00–13:00,
   13:00–17:00, 17:00–21:00, 21:00–close IST), never the 08:00 wall-clock bucket.
 
-## Contract rollover (staged)
+## Contract rollover (staged, race-safe)
 
 When the resolver reports a new active security id: the new contract's M5/M15/H1 history is
-loaded, H4 derived, minimum history validated, a fresh observer warmed, a pipeline seeded, the
-new id subscribed, and only then the observer / history / pipeline / active instrument are
-switched atomically and the old id unsubscribed. Any failure keeps the old contract running
-and reports `rollover ... FAILED` in health and Discord.
+loaded, H4 derived, minimum history validated, a fresh observer warmed and a pipeline seeded
+(`ROLLOVER_WARMING`). The prepared runtime is registered under the new security id *before*
+`subscribe`, so ticks that arrive during the subscription are routed into it rather than lost;
+then observer / history / pipeline / active instrument switch atomically and the old id is
+unsubscribed. The symbol is then `RECOVERING_GAP` until the new contract's history is verified
+against its live stream (the current, partial minute is broker-verified like any other), and
+only then `LIVE`. Any failure keeps the old contract running and reports `rollover ... FAILED`.
+Session trend rows are contract-aware (`session_state` is unique per symbol, security id, date
+and session), so a same-day rollover never overwrites the old contract's session.
 
 ## Health
 
@@ -142,8 +165,10 @@ symbol: `LIVE`, `WARMING`, `RECOVERING_GAP`, `ROLLOVER_WARMING`, `STALE` or `ERR
 security id, expiry, feed connection, reconnect count, unresolved gaps, last tick and the
 latest closed M1/M5/M15/H1/H4. A connected feed with missing candles is not healthy. Background
 tasks are supervised: feed / flush / housekeeping restart with backoff and repeated failure
-shuts the service down; Discord failure degrades to `discord=error` and retries while
-observation continues.
+shuts the service down; a supervised task that *returns* while the service is still running is
+treated as a failure and restarted the same way; Discord failure degrades to `discord=error`
+and retries while observation continues. A symbol with no tick for 90 s while the exchange is
+open is `STALE`.
 
 ## Restart safety
 
@@ -152,6 +177,13 @@ Replaying the same history into the same SQLite file changes nothing: candles, i
 originating detection), lifecycle events (unique per setup / candle / target state),
 clearances, snapshots, outcomes and day frames (derived from stored candles) are idempotent.
 Monitor subscriptions are persisted in `monitor_subscriptions` and restored on startup.
+
+Schema migrations (`schema_version`): v2 consolidates pre-v2 duplicate setups per origin
+detection *before* enforcing uniqueness, keeping the canonical row (terminal state, then latest
+progress, then richest history), repointing events / clearances / Discord card references and
+refusing with a report when candidates are ambiguous; v3 rebuilds `session_state` with the
+contract-aware key while preserving rows and ids. Outcome updates are filtered by contract in
+SQL (`pending_outcomes(security_id, limit)`), so one contract's backlog cannot starve another.
 
 ## Discord card
 
@@ -194,7 +226,7 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 | 12 | breakout events + lifecycle state machine with `setup_events` per transition | `detection/breakout.py`, `setups/lifecycle.py` | `test_detection.py`, `test_lifecycle.py` |
 | 13 | RSI value / direction, 30-50-70 events stored | `indicators/engine.py`, `detection/rsi_events.py` | `test_indicators.py`, `test_detection.py` |
 | 14 | MTF reads, ALIGNED / AGAINST / CONFLICT / NO CONTEXT, early reversal, sideways non-directional | `mtf/context.py` | `test_mtf_trend.py` |
-| 15 | present + session trend, exchange calendar with holidays / overrides | `mtf/trend.py`, `market/sessions.py`, `config/session_overrides.yaml` | `test_mtf_trend.py`, `test_continuity.py` |
+| 15 | present + session trend, exchange calendar with holidays / overrides | `mtf/trend.py`, `market/sessions.py`, `config/exchange_calendar.yaml` | `test_mtf_trend.py`, `test_calendar.py`, `test_continuity.py` |
 | 16 | confirmation engine, INITIAL STRICT RESEARCH POLICY, `policy_version` | `confirmation/policy.py`, `config/confirmation_policy.yaml` | `test_confirmation.py` |
 | 17 | counter-trend protection (`REACTION DETECTED` + ⚠ block, never bare BUY) | `confirmation/policy.py`, `discord/card_builder.py` | `test_confirmation.py`, `test_discord.py` |
 | 18 | factual fakeout flags | `confirmation/fakeout.py` | `test_confirmation.py` |
@@ -231,7 +263,11 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
   `outcomes.contract_specs` config exists for a later explicit opt-in.
 * **Health** is a structured log line plus the Discord status message; there is no HTTP endpoint.
 * **Default branch.** GitHub's default branch must be switched to `main` in the repository
-  settings (Settings → Branches); the code lives on `main` and the API used here cannot change it.
+  settings (Repository Settings → Default branch → main); the code lives on `main` and the API
+  used here cannot change it.
+* **MCX 2026 calendar** is populated from broker mirrors of the MCX holiday circular
+  (`verified_against_official_circular: false` until checked against mcxindia.com); the Diwali
+  Muhurat session is not entered because its timings were not published in those sources.
 * **Model training (§28)** is intentionally not implemented; only interfaces and the registry table exist.
 * The Discord runtime (gateway login, message send / edit) is not exercised in tests; the card,
   chart planner / renderer, coalescer and message-ref logic are.

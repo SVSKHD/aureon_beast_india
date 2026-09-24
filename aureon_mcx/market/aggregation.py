@@ -41,15 +41,24 @@ class Completeness(str, Enum):
 
 @dataclass(frozen=True)
 class AggregationResult:
-    candle: Candle
+    candle: Candle | None          # None only for a GAP bucket with no trusted constituent at all
     status: Completeness
     expected: int
     present: int
     missing: tuple[datetime, ...] = ()
+    timeframe: Timeframe | None = None
+    open_time: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.candle is not None:
+            object.__setattr__(self, "timeframe", self.candle.timeframe)
+            object.__setattr__(self, "open_time", self.candle.open_time)
+        elif self.timeframe is None or self.open_time is None:
+            raise ValueError("AggregationResult without a candle needs timeframe and open_time")
 
     @property
     def is_complete(self) -> bool:
-        return self.status is Completeness.COMPLETE
+        return self.status is Completeness.COMPLETE and self.candle is not None
 
 
 # ------------------------------------------------------------------ policies
@@ -157,17 +166,16 @@ class TimeframeAggregator:
             log.debug("aggregation_bucket_dropped symbol=%s target=%s bucket=%s reason=no_expected_constituents", self.symbol,
                       self.target.value, b.open_time.isoformat())
             return None
-        ordered = sorted({**b.extra, **b.constituents}.values(), key=lambda c: c.open_time)
-        first, last = ordered[0], ordered[-1]
-        oi = next((c.open_interest for c in reversed(ordered) if c.open_interest is not None), None)
-        candle = Candle(
-            symbol=self.symbol, security_id=self.security_id, timeframe=self.target, open_time=b.open_time, open=first.open,
-            high=max(c.high for c in ordered), low=min(c.low for c in ordered), close=last.close,
-            volume=sum(c.volume for c in ordered), open_interest=oi, source="aggregated", is_closed=True, expiry_date=self.expiry_date,
-        )
+        if b.extra:
+            # Off-session constituents are audit-only: they never shape OHLC / volume / OI of a
+            # trusted bar (an outside-hours print, however extreme, is not part of the session).
+            log.warning("aggregation_extra_ignored symbol=%s target=%s bucket=%s extra=%s", self.symbol, self.target.value,
+                        b.open_time.isoformat(), ",".join(t.isoformat() for t in sorted(b.extra)[:6]))
         missing = tuple(t for t in b.expected if t not in b.constituents)
         status = Completeness.COMPLETE if not missing else Completeness.GAP_DETECTED
-        res = AggregationResult(candle=candle, status=status, expected=len(b.expected), present=len(b.constituents), missing=missing)
+        candle = self._build(b.open_time, list(b.constituents.values()), is_closed=True) if b.constituents else None
+        res = AggregationResult(candle=candle, status=status, expected=len(b.expected), present=len(b.constituents), missing=missing,
+                                timeframe=self.target, open_time=b.open_time)
         if status is Completeness.GAP_DETECTED:
             log.warning("aggregation_gap symbol=%s target=%s bucket=%s expected=%d present=%d missing=%s", self.symbol,
                         self.target.value, b.open_time.isoformat(), len(b.expected), len(b.constituents),
@@ -196,11 +204,15 @@ class TimeframeAggregator:
         if any(t not in b.constituents for t in b.expected):
             return None
         self._gap_buckets.pop(start, None)
-        ordered = sorted(b.constituents.values(), key=lambda c: c.open_time)
+        return self._build(b.open_time, list(b.constituents.values()), is_closed=True)
+
+    def _build(self, open_time: datetime, constituents: list[Candle], *, is_closed: bool) -> Candle:
+        ordered = sorted(constituents, key=lambda c: c.open_time)
         oi = next((c.open_interest for c in reversed(ordered) if c.open_interest is not None), None)
-        return Candle(symbol=self.symbol, security_id=self.security_id, timeframe=self.target, open_time=b.open_time, open=ordered[0].open,
+        return Candle(symbol=self.symbol, security_id=self.security_id, timeframe=self.target, open_time=open_time, open=ordered[0].open,
                       high=max(c.high for c in ordered), low=min(c.low for c in ordered), close=ordered[-1].close,
-                      volume=sum(c.volume for c in ordered), open_interest=oi, source="aggregated", is_closed=True, expiry_date=self.expiry_date)
+                      volume=sum(c.volume for c in ordered), open_interest=oi, source="aggregated", is_closed=is_closed,
+                      expiry_date=self.expiry_date)
 
     def add(self, candle: Candle) -> list[AggregationResult]:
         """Feed a CLOSED source candle. Returns 0..2 results (a bucket closed by a later
@@ -262,13 +274,9 @@ class TimeframeAggregator:
     @property
     def partial(self) -> Candle | None:
         b = self._bucket
-        if b is None or not (b.constituents or b.extra):
-            return None
-        ordered = sorted({**b.extra, **b.constituents}.values(), key=lambda c: c.open_time)
-        return Candle(symbol=self.symbol, security_id=self.security_id, timeframe=self.target, open_time=b.open_time,
-                      open=ordered[0].open, high=max(c.high for c in ordered), low=min(c.low for c in ordered), close=ordered[-1].close,
-                      volume=sum(c.volume for c in ordered), open_interest=ordered[-1].open_interest, source="aggregated",
-                      is_closed=False, expiry_date=self.expiry_date)
+        if b is None or not b.constituents:
+            return None  # extras alone never form even a partial bar
+        return self._build(b.open_time, list(b.constituents.values()), is_closed=False)
 
     @property
     def open_bucket_status(self) -> tuple[datetime, int, int] | None:
@@ -291,7 +299,7 @@ def aggregate_closed(candles: list[Candle], target: Timeframe, tz=IST, now: date
         tail = agg.flush_at(now)
         if tail is not None:
             results.append(tail)
-    return [r.candle for r in results if r.is_complete or include_gaps]
+    return [r.candle for r in results if r.candle is not None and (r.is_complete or include_gaps)]
 
 
 def aggregate_with_status(candles: list[Candle], target: Timeframe, calendar: "SessionCalendar | None" = None,

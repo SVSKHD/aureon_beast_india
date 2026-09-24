@@ -330,3 +330,28 @@ def test_pipeline_duplicate_and_out_of_order_candle_delivery_is_harmless(cal):
     # a late duplicate of an already-dispatched M1 is ignored, never re-opening a bar
     p.on_m1_closed(m1[2])
     assert len([c for c in closed if c.timeframe is Timeframe.M5]) == 3
+
+
+def test_off_session_constituent_never_alters_trusted_bar(app_config):
+    """An extreme print outside market hours that lands inside a bucket is audit-only: the
+    bar built from the expected (in-session) constituents must be identical with or without it."""
+    cal = SessionCalendar(app_config.sessions)
+    # 2026-09-21 (US DST): MCX closes 23:30 IST, so the H1 bucket 23:00 holds six M5 (23:00..23:25)
+    start = datetime(2026, 9, 21, 17, 30, tzinfo=timezone.utc)  # 23:00 IST
+    m5 = make_candles(6, start=start, tf=Timeframe.M5)
+    reference = aggregate_with_status(m5, Timeframe.H1, calendar=cal)
+    assert len(reference) == 1 and reference[0].status is Completeness.COMPLETE
+    rogue = Candle(symbol="GOLD", security_id="428291", timeframe=Timeframe.M5, open_time=start + timedelta(minutes=35),  # 23:35 IST
+                   open=1.0, high=999999.0, low=0.5, close=1.0, volume=1e9, open_interest=1.0, expiry_date="2026-10-05")
+    with_rogue = aggregate_with_status(m5 + [rogue], Timeframe.H1, calendar=cal)
+    assert len(with_rogue) == 1 and with_rogue[0].status is Completeness.COMPLETE
+    assert with_rogue[0].candle == reference[0].candle
+    assert with_rogue[0].candle.high < 999999.0 and with_rogue[0].candle.volume == reference[0].candle.volume
+    assert with_rogue[0].candle.open_interest == reference[0].candle.open_interest
+    # a bucket that holds ONLY an off-session print is a gap with no bar, never a fabricated one
+    agg = TimeframeAggregator(Timeframe.M5, Timeframe.H1, "GOLD", "428291", "2026-10-05", calendar=cal)
+    assert agg.add(rogue) == []
+    assert agg.partial is None
+    res = agg.flush_at(start + timedelta(hours=1))
+    assert res is not None and res.status is Completeness.GAP_DETECTED and res.candle is None
+    assert res.expected == 6 and res.present == 0 and res.open_time == start and res.timeframe is Timeframe.H1
