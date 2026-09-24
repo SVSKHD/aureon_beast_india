@@ -318,6 +318,41 @@ CREATE TABLE IF NOT EXISTS model_registry (
 );
 """,
     ),
+    (
+        2,
+        """
+-- one setup per originating detection (replay / restart safety); dedupe first, keep the oldest
+DELETE FROM setups WHERE id NOT IN (SELECT MIN(id) FROM setups GROUP BY origin_detection_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_setups_origin_detection ON setups(origin_detection_id);
+
+-- one lifecycle transition per (setup, candle, target state); dedupe first, keep the oldest
+DELETE FROM setup_events WHERE id NOT IN (SELECT MIN(id) FROM setup_events GROUP BY setup_id, candle_id, to_state);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_setup_events_transition ON setup_events(setup_id, candle_id, to_state);
+
+CREATE TABLE IF NOT EXISTS monitor_subscriptions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    setup_id        INTEGER NOT NULL REFERENCES setups(id) ON DELETE CASCADE,
+    discord_user_id TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE(setup_id, discord_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS market_data_gaps (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT NOT NULL,
+    security_id         TEXT NOT NULL,
+    timeframe           TEXT NOT NULL,
+    bucket_open_time    TEXT NOT NULL,
+    expected            INTEGER NOT NULL,
+    present             INTEGER NOT NULL,
+    missing_json        TEXT NOT NULL,
+    detected_at         TEXT NOT NULL,
+    resolved_at         TEXT,
+    resolution          TEXT,
+    UNIQUE(security_id, timeframe, bucket_open_time)
+);
+""",
+    ),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

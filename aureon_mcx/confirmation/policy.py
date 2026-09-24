@@ -53,14 +53,15 @@ def evaluate_clearance(inp: ConfirmationInputs, policy: ConfirmationPolicyConfig
     if rules.block_on_fakeout_risk and s.state is SetupState.FAKEOUT_RISK:
         blockers.append("fakeout-risk lifecycle active")
 
-    # 2. EMA relation
+    # 2. EMA relation (labels use the configured periods)
+    ema_names = f"EMA{ind.ema_fast_period}/EMA{ind.ema_slow_period}" if ind is not None else "EMA fast/slow"
     if rules.require_ema_alignment:
         if ind is None or ind.ema_fast is None or ind.ema_slow is None:
-            blockers.append("EMA20/EMA50 unavailable (indicators not warmed)")
+            blockers.append(f"{ema_names} unavailable (indicators not warmed)")
         elif (ind.ema_fast > ind.ema_slow) if bull else (ind.ema_fast < ind.ema_slow):
             badges.append("EMA ALIGNED")
         else:
-            blockers.append("EMA20/EMA50 do not confirm direction")
+            blockers.append(f"{ema_names} do not confirm direction")
             warnings.append("⚠ EMA NOT ALIGNED")
 
     # 3. RSI side of 50

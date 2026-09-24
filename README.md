@@ -62,7 +62,7 @@ tests/                         pytest suite (recorded fixtures, no network)
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # fill DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN / DISCORD_*
-pytest                          # 100+ tests, no network
+pytest                          # 130+ tests, no network
 python main_aureon.py           # optional: --config-dir config --env-file .env
 ```
 
@@ -100,6 +100,59 @@ observer live
 discord live
 ```
 
+## Market-data continuity (fail closed)
+
+Aureon never analyses an incomplete or discontinuous candle stream.
+
+* **Completeness.** Every aggregated bar (M1→M5, M5→M15/H1, H1→H4) tracks the expected
+  source open-times for its bucket (calendar-aware: only open-market intervals count, the last
+  bucket of the day is shorter). Duplicates never count twice, misaligned bars never count,
+  out-of-order delivery is tolerated. A bucket whose boundary passes with constituents missing
+  is `GAP_DETECTED`: it is never dispatched to the observer, the gap is recorded
+  (`market_data_gaps`), the symbol goes to `ERROR` and later complete bars are held back until
+  the gap is repaired with the exact broker candle.
+* **Quiet minutes.** While the feed is connected and the exchange is open, a minute without
+  trades becomes a flat M1 (last price, zero volume). Minutes during a disconnect are never
+  invented: they are gaps.
+* **Reconnect recovery.** On every WebSocket connect (startup included, so starting at 10:02
+  is handled) the closed M1 candles between the last processed minute (or the minute left open
+  at disconnect) and now are fetched from the Dhan historical API and fed through the same
+  pipeline in chronological order while live ticks are buffered, then buffered ticks are
+  replayed. The symbol is `LIVE` only when continuity is restored; a failed recovery leaves
+  it in `ERROR` with analytics suspended.
+* **Exchange calendar.** `config/sessions.yaml` plus the optional
+  `config/session_overrides.yaml` (holidays, closed days, special sessions with their own
+  start/end) drive `SessionCalendar`, the single source for "is the exchange open", trading
+  date, session end and H4 buckets.
+* **H4 policy.** H4 bars are anchored to the configured trading-day start (09:00–13:00,
+  13:00–17:00, 17:00–21:00, 21:00–close IST), never the 08:00 wall-clock bucket.
+
+## Contract rollover (staged)
+
+When the resolver reports a new active security id: the new contract's M5/M15/H1 history is
+loaded, H4 derived, minimum history validated, a fresh observer warmed, a pipeline seeded, the
+new id subscribed, and only then the observer / history / pipeline / active instrument are
+switched atomically and the old id unsubscribed. Any failure keeps the old contract running
+and reports `rollover ... FAILED` in health and Discord.
+
+## Health
+
+`health.status_line()` (log + Discord status message) reports component states and, per
+symbol: `LIVE`, `WARMING`, `RECOVERING_GAP`, `ROLLOVER_WARMING`, `STALE` or `ERROR`, with
+security id, expiry, feed connection, reconnect count, unresolved gaps, last tick and the
+latest closed M1/M5/M15/H1/H4. A connected feed with missing candles is not healthy. Background
+tasks are supervised: feed / flush / housekeeping restart with backoff and repeated failure
+shuts the service down; Discord failure degrades to `discord=error` and retries while
+observation continues.
+
+## Restart safety
+
+Replaying the same history into the same SQLite file changes nothing: candles, indicators
+(the first analysed values are authoritative), pivots, detections, setups (unique per
+originating detection), lifecycle events (unique per setup / candle / target state),
+clearances, snapshots, outcomes and day frames (derived from stored candles) are idempotent.
+Monitor subscriptions are persisted in `monitor_subscriptions` and restored on startup.
+
 ## Discord card
 
 Six full-width sections in fixed order — `1 · SETUP`, `2 · TREND`, `3 · MOMENTUM`,
@@ -129,8 +182,8 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 | 0 | principles / layering | whole package; Discord reads `views.SetupView` + stored rows only | `test_discord.py`, `test_observer.py` |
 | 1 | broker / market (Dhan v2, `MCX_COMM`, `FUTCOM`, no hard-coded ids) | `broker/dhan/*`, `config/symbols.yaml` | `test_symbol_resolver.py` |
 | 2 | SymbolResolver (exact base-name, policy enum, rollover, fail closed, log shape) | `broker/dhan/symbol_resolver.py`, `instruments.py` | `test_symbol_resolver.py` |
-| 3 | historical provider, Candle model, cache, timeframe roles, closed-only aggregation | `broker/dhan/historical.py`, `market/candle.py`, `market/aggregation.py` | `test_market_data.py` |
-| 4 | live feed WebSocket, reconnect/backoff/resubscribe, rollover swap, tick→M1→M5 | `broker/dhan/live_feed.py`, `market/candle_builder.py`, `app.py` | `test_live_feed.py`, `test_market_data.py`, `test_app.py` |
+| 3 | historical provider, Candle model, cache, timeframe roles, closed-only + complete aggregation | `broker/dhan/historical.py`, `market/candle.py`, `market/aggregation.py` | `test_market_data.py`, `test_continuity.py` |
+| 4 | live feed WebSocket, reconnect/backoff/resubscribe + gap recovery, staged rollover, tick→M1→M5 | `broker/dhan/live_feed.py`, `market/candle_builder.py`, `continuity.py`, `app.py` | `test_live_feed.py`, `test_continuity.py`, `test_app.py` |
 | 5 | SQLite WAL/FK/busy_timeout, migrations, tables, write ordering, parquet flag | `storage/*` | `test_storage.py` |
 | 6 | indicators persisted per candle, configurable periods | `indicators/engine.py`, `storage/repositories.py` | `test_indicators.py` |
 | 7 | early EMA vs actual cross, thresholds, payload, exact labels | `detection/ema.py` | `test_detection.py` |
@@ -141,7 +194,7 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 | 12 | breakout events + lifecycle state machine with `setup_events` per transition | `detection/breakout.py`, `setups/lifecycle.py` | `test_detection.py`, `test_lifecycle.py` |
 | 13 | RSI value / direction, 30-50-70 events stored | `indicators/engine.py`, `detection/rsi_events.py` | `test_indicators.py`, `test_detection.py` |
 | 14 | MTF reads, ALIGNED / AGAINST / CONFLICT / NO CONTEXT, early reversal, sideways non-directional | `mtf/context.py` | `test_mtf_trend.py` |
-| 15 | present + session trend (configurable IST windows, `is_current`, `closed_at`) | `mtf/trend.py`, `market/sessions.py` | `test_mtf_trend.py`, `test_market_data.py` |
+| 15 | present + session trend, exchange calendar with holidays / overrides | `mtf/trend.py`, `market/sessions.py`, `config/session_overrides.yaml` | `test_mtf_trend.py`, `test_continuity.py` |
 | 16 | confirmation engine, INITIAL STRICT RESEARCH POLICY, `policy_version` | `confirmation/policy.py`, `config/confirmation_policy.yaml` | `test_confirmation.py` |
 | 17 | counter-trend protection (`REACTION DETECTED` + ⚠ block, never bare BUY) | `confirmation/policy.py`, `discord/card_builder.py` | `test_confirmation.py`, `test_discord.py` |
 | 18 | factual fakeout flags | `confirmation/fakeout.py` | `test_confirmation.py` |
@@ -160,7 +213,7 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 | 31 | config (.env + YAML, pydantic, fail closed) | `config/*` | `test_config.py` |
 | 32 | startup flow order, structured logs, abort on 1–9, graceful shutdown | `app.py`, `main_aureon.py` | `test_app.py` |
 | 33 | Discord rate-limit safety (hash reconcile, debounce, no bulk refresh) | `discord/coalescer.py`, `discord/message_refs.py` | `test_discord.py` |
-| 34 | test matrix | `tests/` (102 tests, recorded fixtures) | — |
+| 34 | test matrix | `tests/` (131 tests, recorded fixtures, CI on Python 3.11 / 3.12) | `.github/workflows/test.yml` |
 | 35 | deliverables / commit-per-step | git history, this README | — |
 
 ## Not fully completed / explicit caveats
@@ -172,12 +225,13 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 * **`nearest_liquid` policy** uses the nearest non-expired standard contract outside the rollover
   window; the instrument master carries no liquidity data (see `# DECISION` in the resolver).
 * **PostgreSQL backend** is selectable in config but not implemented; startup fails closed.
-* **Live M15 / H1** are aggregated locally from closed M5 candles; exact broker candles are used
-  for warmup only.
+* **Live M15 / H1** are aggregated locally from closed, complete M5 candles; exact broker candles are
+  used for warmup and for gap repair.
 * **Money conversion** is not implemented (outcomes stay in points and ATR units); the
   `outcomes.contract_specs` config exists for a later explicit opt-in.
-* **Health** is a log line plus the Discord status message; there is no HTTP endpoint.
-* **Monitor subscriptions** live in memory and are lost on restart.
+* **Health** is a structured log line plus the Discord status message; there is no HTTP endpoint.
+* **Default branch.** GitHub's default branch must be switched to `main` in the repository
+  settings (Settings → Branches); the code lives on `main` and the API used here cannot change it.
 * **Model training (§28)** is intentionally not implemented; only interfaces and the registry table exist.
 * The Discord runtime (gateway login, message send / edit) is not exercised in tests; the card,
   chart planner / renderer, coalescer and message-ref logic are.

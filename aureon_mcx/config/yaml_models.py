@@ -130,12 +130,74 @@ class TrendSpec(StrictModel):
     present_lookback_bars: int = Field(default=6, ge=1)
 
 
+class SessionOverride(StrictModel):
+    """Date-specific exchange rule: a full holiday or a special/partial session."""
+
+    date: str
+    closed: bool = False
+    start: str | None = None
+    end: str | None = None
+    note: str = ""
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        parse_hhmm(v)
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "SessionOverride":
+        if self.closed and (self.start or self.end):
+            raise ValueError(f"override {self.date}: closed=true cannot also set start/end")
+        if not self.closed and not (self.start or self.end):
+            raise ValueError(f"override {self.date}: must set closed=true or a start/end")
+        return self
+
+
+class SessionOverridesConfig(StrictModel):
+    """Optional `session_overrides.yaml`: holidays and date-specific sessions."""
+
+    weekend_closed: bool = True
+    holidays: list[str] = Field(default_factory=list)
+    overrides: list[SessionOverride] = Field(default_factory=list)
+
+    @field_validator("holidays")
+    @classmethod
+    def _holidays(cls, v: list[str]) -> list[str]:
+        from datetime import date as _date
+
+        out = []
+        for d in v:
+            _date.fromisoformat(str(d).strip())
+            out.append(str(d).strip())
+        return out
+
+    @model_validator(mode="after")
+    def _unique_dates(self) -> "SessionOverridesConfig":
+        dates = [o.date for o in self.overrides]
+        if len(dates) != len(set(dates)):
+            raise ValueError("session overrides must have unique dates")
+        return self
+
+
 class SessionsConfig(StrictModel):
     timezone: str = "Asia/Kolkata"
     trading_day: TradingDaySpec = TradingDaySpec()
     sessions: list[SessionWindow]
     mcx_sessions: list[SessionWindow] = Field(default_factory=list)
     trend: TrendSpec = TrendSpec()
+    # Populated by the loader from config/session_overrides.yaml (optional file).
+    overrides: SessionOverridesConfig = SessionOverridesConfig()
 
     @field_validator("timezone")
     @classmethod
@@ -224,7 +286,7 @@ class MtfSpec(StrictModel):
 class DeclutterSpec(StrictModel):
     max_labeled_detections: int = Field(default=4, ge=0)
     max_labeled_setup_events: int = Field(default=3, ge=0)
-    context_panel_lines: int = Field(default=8, ge=1)
+    context_panel_lines: int = Field(default=10, ge=1)
     chart_bars: int = Field(default=120, ge=20)
 
 

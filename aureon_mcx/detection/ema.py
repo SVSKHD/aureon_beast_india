@@ -34,7 +34,8 @@ class EmaDetector:
             return []
         out: list[Detection] = []
         base = dict(
-            ema20=ind.ema_fast, ema50=ind.ema_slow, gap=gap, previous_gap=prev, rsi=ind.rsi, atr=ind.atr,
+            ema_fast=ind.ema_fast, ema_slow=ind.ema_slow, ema_fast_period=ind.ema_fast_period, ema_slow_period=ind.ema_slow_period,
+            gap=gap, previous_gap=prev, rsi=ind.rsi, rsi_period=ind.rsi_period, atr=ind.atr, atr_period=ind.atr_period,
             timeframe=candle.timeframe.value, symbol=candle.symbol, security_id=candle.security_id,
             timestamp=candle.open_time.isoformat(), price=candle.close, session=session,
         )
@@ -58,7 +59,7 @@ class EmaDetector:
         if shrinking and self._streak >= self.min_shrinking_bars and within and not self._early_fired:
             self._early_fired = True
             payload = {**base, "shrinking_bars": self._streak, "approach_atr_fraction": self.approach_atr_fraction}
-            if gap < 0:  # EMA20 below EMA50, approaching from below
+            if gap < 0:  # fast EMA below slow EMA, approaching from below
                 out.append(self._det(candle, ind, session, "EARLY_BULLISH", Direction.BULLISH, LABEL_EARLY_BULLISH, payload))
             elif gap > 0:
                 out.append(self._det(candle, ind, session, "EARLY_BEARISH", Direction.BEARISH, LABEL_EARLY_BEARISH, payload))

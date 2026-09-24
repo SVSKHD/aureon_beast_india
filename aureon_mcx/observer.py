@@ -26,6 +26,7 @@ from aureon_mcx.market.sessions import SessionCalendar
 from aureon_mcx.market.timeframe import Timeframe
 from aureon_mcx.market.timeutil import fmt_ist
 from aureon_mcx.mtf import MtfAssessment, SessionTrendTracker, TimeframeRead, TrendDirection, assess_mtf, classify_timeframe, present_trend
+from aureon_mcx.mtf.context import ema_relation
 from aureon_mcx.outcomes import OutcomeService, cohort_stats
 from aureon_mcx.setups import LifecycleParams, Setup, SetupEvent, SetupState, SetupTracker, create_setup, family_for
 from aureon_mcx.storage.repositories import Repositories
@@ -159,7 +160,8 @@ class SymbolObserver:
             return
         # MTF changed: re-evaluate clearance for open setups (no lifecycle evaluation on a higher-tf bar)
         for setup in self.repos.setups.open_for(self.security_id, self.primary):
-            self._clear_and_publish(setup, last_primary, ind, publish)
+            if setup.updated_open_time <= last_primary.open_time:
+                self._clear_and_publish(setup, last_primary, ind, publish)
 
     # ------------------------------------------------------------- primary
     def _on_primary(self, candle: Candle, ind: IndicatorRow, upd, publish: bool) -> None:
@@ -177,9 +179,10 @@ class SymbolObserver:
         tol = self.cfg.analysis.liquidity.equal_level_tolerance_atr * (ind.atr or 0.0)
         levels = build_levels(structure.all_pivots, pdh, pdl, sh, sl, tol)
         # day frame + session trend
-        self.repos.day_frames.upsert(self.symbol, self.security_id, self.expiry, tf, trading_date, candle,
-                                     self.calendar.trading_day_closed(trading_date, candle.close_time),
-                                     structure.context().value, structure.sequence())
+        span_start, span_end = self.calendar.trading_day_span(trading_date)
+        self.repos.day_frames.refresh(self.symbol, self.security_id, self.expiry, tf, trading_date, span_start, span_end,
+                                      self.calendar.trading_day_closed(trading_date, candle.close_time),
+                                      structure.context().value, structure.sequence())
         for row in self.sessions.update(candle, ind):
             self.repos.session_state.upsert(row.to_record(self.symbol, self.security_id))
         # detections
@@ -209,35 +212,43 @@ class SymbolObserver:
         # context
         self.present = present_trend(list(self.candles[tf]), ind, structure.context(), self.cfg.sessions.trend.present_lookback_bars,
                                      self.cfg.sessions.trend.min_move_atr).direction
-        # lifecycle for existing setups
-        open_setups = self.repos.setups.open_for(self.security_id, tf)
+        # lifecycle for existing setups (replay safety: a setup is only evaluated by candles at
+        # or after its last update; older candles belong to an already-audited past)
+        open_setups = [s for s in self.repos.setups.open_for(self.security_id, tf) if s.updated_open_time <= candle.open_time]
         for setup in open_setups:
             for t in self.tracker.evaluate(setup, candle, ind):
                 self.repos.setups.update_state(setup)
                 self.repos.setups.add_event(SetupEvent(setup.id, candle.id, t.from_state, t.to_state, t.reason, t.evidence, candle.open_time))
                 log.info("setup_transition %s", kv(symbol=self.symbol, setup_id=setup.id, from_state=t.from_state.value,
                                                   to_state=t.to_state.value, reason=t.reason, open_time=fmt_ist(candle.open_time)))
-        # new setups from this candle's detections (evaluated from the next candle)
+        # new setups from this candle's detections (evaluated from the next candle). The
+        # same-anchor dedupe looks at setups that were open AT THIS CANDLE (replay-stable).
+        open_at_candle = self.repos.setups.open_at(self.security_id, tf, candle.open_time)
         for d in stored_dets:
             created = create_setup(d, candle, ind)
             if created is None:
                 continue
             setup, t = created
             if any(s.family == setup.family and s.direction == setup.direction and abs(s.anchor_price - setup.anchor_price) <= 1e-9
-                   for s in open_setups):
+                   and s.origin_detection_id != d.id for s in open_at_candle):
                 continue
             setup.state = t.to_state
-            self.repos.setups.insert(setup)
+            setup, created = self.repos.setups.insert_or_existing(setup)
+            if not created:
+                # replay / restart: the originating detection already produced this setup
+                if not setup.state.is_terminal and all(s.id != setup.id for s in open_setups):
+                    open_setups.append(setup)
+                continue
             self.repos.setups.add_event(SetupEvent(setup.id, candle.id, t.from_state, t.to_state, t.reason, t.evidence, candle.open_time, d.id))
             open_setups.append(setup)
             log.info("setup_created %s", kv(symbol=self.symbol, setup_id=setup.id, family=setup.family, direction=setup.direction.value,
                                             anchor=setup.anchor_price, invalidation=setup.invalidation_price, origin=d.kind))
-        # feature snapshots (immutable) for meaningful detections
-        snap_ctx = self._snapshot_context(structure)
+        # feature snapshots (immutable) for meaningful detections: the MTF assessment is
+        # frozen against the detection's own direction using only reads available now
         for d in stored_dets:
             if d.direction is Direction.NEUTRAL:
                 continue
-            self.outcomes.freeze(d, candle, ind, snap_ctx, family_for(d) or d.family.value)
+            self.outcomes.freeze(d, candle, ind, self._snapshot_context(structure, d.direction), family_for(d) or d.family.value)
         # clearance + presentation
         for setup in open_setups:
             self._clear_and_publish(setup, candle, ind, publish)
@@ -246,13 +257,18 @@ class SymbolObserver:
         self.repos.symbol_state.upsert(self.symbol, self.security_id, self.expiry, self.present.value,
                                        {tf_.value: r.to_dict() for tf_, r in self.reads.items()}, structure.state_dict(), candle.open_time)
 
-    def _snapshot_context(self, structure: StructureEngine) -> dict:
+    def _snapshot_context(self, structure: StructureEngine, direction: Direction) -> dict:
         lh, ll = structure.last_high(), structure.last_low()
         cur = self.sessions.current("global")
         mcx = self.sessions.current("mcx")
+        mtf = assess_mtf(self.reads, direction, self.primary) if direction is not Direction.NEUTRAL else None
+        higher_available = any(r.direction.is_directional for tf, r in self.reads.items() if tf.is_higher_than(self.primary))
         return {"present_trend": self.present.value, "session_trend": cur.trend.value if cur else None,
                 "mcx_session": mcx.session_name if mcx else None, "mtf_reads": {tf.value: r.direction.value for tf, r in self.reads.items()},
-                "mtf_state": None, "structure_context": structure.context().value, "structure_sequence": structure.sequence(),
+                "mtf_state": mtf.alignment.value if mtf else None, "mtf_alignment": mtf.alignment.name if mtf else None,
+                "mtf_consensus": mtf.consensus.value if (mtf and mtf.consensus) else None, "mtf_higher_available": higher_available,
+                "mtf_early_reversal": mtf.early_reversal if mtf else None, "mtf_notes": list(mtf.notes) if mtf else None,
+                "structure_context": structure.context().value, "structure_sequence": structure.sequence(),
                 "last_high_label": lh.label.value if lh else None, "last_low_label": ll.label.value if ll else None,
                 "liquidity_state": self.latest_state(DetectionFamily.LIQUIDITY), "breakout_state": self.latest_state(DetectionFamily.BREAKOUT),
                 "wick_state": self.latest_state(DetectionFamily.WICK)}
@@ -292,9 +308,7 @@ class SymbolObserver:
         refs = [f"detection #{setup.origin_detection_id} · {setup.context.get('origin_label', '')}"]
         refs += [f"event #{e['id']} · {e['to_state']} · {fmt_ist(e['open_time'], '%d %b %H:%M')}" for e in events[-5:]]
         cohort_lines = self._cohort_lines(setup.family, setup.direction.value, candle.open_time)
-        ema_rel = "n/a"
-        if ind.ema_fast is not None and ind.ema_slow is not None:
-            ema_rel = "EMA20 > EMA50" if ind.ema_fast > ind.ema_slow else ("EMA20 < EMA50" if ind.ema_fast < ind.ema_slow else "EMA20 = EMA50")
+        ema_rel = ema_relation(ind)
         ctx_lines = [f"origin: {setup.context.get('origin_label', setup.family)}"]
         if setup.context.get("level_kind"):
             ctx_lines.append(f"level: {str(setup.context['level_kind']).replace('_', ' ')}")
@@ -313,6 +327,7 @@ class SymbolObserver:
             open_interest=ind.open_interest, badges=list(clearance.badges), warnings=list(clearance.evidence.get("warnings", [])),
             fakeout_flags=list(clearance.fakeout_flags), blockers=list(clearance.blockers), cleared=clearance.cleared,
             policy_version=clearance.policy_version, detection_refs=refs, cohort_lines=cohort_lines, is_terminal=setup.state.is_terminal,
+            ema_fast_period=ind.ema_fast_period, ema_slow_period=ind.ema_slow_period, rsi_period=ind.rsi_period, atr_period=ind.atr_period,
         )
 
     def _cohort_lines(self, family: str, direction: str, open_time: datetime) -> list[str] | None:

@@ -37,7 +37,7 @@ def test_early_bullish_approach():
     assert kinds == ["EARLY_BULLISH"]  # fires once per episode
     d = dets[0]
     assert d.label == LABEL_EARLY_BULLISH and d.direction is Direction.BULLISH and d.family is DetectionFamily.EMA
-    assert d.payload["gap"] == -4 and d.payload["previous_gap"] == -6 and d.payload["ema20"] == 96 and d.payload["ema50"] == 100
+    assert d.payload["gap"] == -4 and d.payload["previous_gap"] == -6 and d.payload["ema_fast"] == 96 and d.payload["ema_slow"] == 100 and d.payload["ema_fast_period"] == 20
     assert d.payload["session"] == "ASIA" and d.payload["timeframe"] == "M5" and "rsi" in d.payload and "atr" in d.payload
 
 

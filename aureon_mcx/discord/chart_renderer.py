@@ -60,6 +60,9 @@ class ChartPlan:
     anchor: float | None = None
     invalidation: float | None = None
     context_lines: list[str] = field(default_factory=list)
+    ema_fast_label: str = "EMA fast"
+    ema_slow_label: str = "EMA slow"
+    rsi_label: str = "RSI"
 
     @property
     def labeled_texts(self) -> list[str]:
@@ -84,7 +87,8 @@ def plan_chart(view: SetupView, candles: list[Candle], indicators: dict[int, Ind
     # matplotlib's default fonts have no emoji glyphs: the chart subtitle is plain text
     subtitle = f"{view.state} · {'CLEARED FOR REVIEW' if view.cleared else 'NOT CLEARED'}"
     plan = ChartPlan(title=view.title, subtitle=subtitle, candles=candles, ema_fast=ema_f, ema_slow=ema_s, rsi=rsi, volume=vol,
-                     anchor=view.anchor_price, invalidation=view.invalidation_price)
+                     anchor=view.anchor_price, invalidation=view.invalidation_price, ema_fast_label=view.ema_fast_name,
+                     ema_slow_label=view.ema_slow_name, rsi_label=view.rsi_name)
     # structure: labels above (highs) / below (lows) + one path per pivot kind
     for p in sorted(pivots, key=lambda p: p.pivot_open_time):
         i = idx.get(p.pivot_open_time)
@@ -119,9 +123,13 @@ def plan_chart(view: SetupView, candles: list[Candle], indicators: dict[int, Ind
         i = idx[e.open_time]
         plan.text_labels.append(ChartLabel(i, candles[i].close, e.to_state.value, "setup_event", False, view.direction))
     # bounded market-context panel
-    ctx = [f"present {view.present_trend} · structure {view.structure_context}", f"{view.structure_sequence or 'no confirmed swings'}",
-           " ".join(f"{tf}:{d}" for tf, d in view.mtf_rows), view.mtf_alignment,
-           f"{view.ema_relation} · RSI {view.rsi:.1f}" if view.rsi is not None else view.ema_relation,
+    # bounded market-context panel: every line is a stored fact carried by the view (no recomputation)
+    session = next((l for l in view.context_lines if l.startswith("session:")), "session: n/a")
+    ctx = [f"setup {view.state} · {view.direction} · anchor {view.anchor_price:,.1f} · invalidation {view.invalidation_price:,.1f}",
+           f"present {view.present_trend} · structure {view.structure_context} · {view.structure_sequence or 'no confirmed swings'}",
+           " ".join(f"{tf}:{d}" for tf, d in view.mtf_rows) + f" · {view.mtf_alignment}",
+           f"{view.ema_relation} · cross: {view.latest_cross or 'none'} · early: {view.early_ema or 'none'}",
+           (f"{view.rsi_name} {view.rsi:.1f} ({view.rsi_direction or 'n/a'})" if view.rsi is not None else f"{view.rsi_name} n/a") + f" · {session}",
            "flags: " + (", ".join(f for f in view.fakeout_flags if not f.startswith("·")) or "none"),
            "blockers: " + ("; ".join(view.blockers[:3]) + (" …" if len(view.blockers) > 3 else "") if view.blockers else "none"),
            "CLEARED FOR REVIEW" if view.cleared else "NOT CLEARED"]
@@ -149,8 +157,8 @@ def render_png(plan: ChartPlan) -> bytes:
         ax.vlines(i, c.low, c.high, color=col, linewidth=0.8)
         ax.add_patch(Rectangle((i - 0.35, min(c.open, c.close)), 0.7, max(abs(c.close - c.open), 1e-9), color=col, linewidth=0))
     xs = list(range(n))
-    ax.plot(xs, [v if v is not None else float("nan") for v in plan.ema_fast], color="#f1c40f", linewidth=1.2, label="EMA20")
-    ax.plot(xs, [v if v is not None else float("nan") for v in plan.ema_slow], color="#3498db", linewidth=1.2, label="EMA50")
+    ax.plot(xs, [v if v is not None else float("nan") for v in plan.ema_fast], color="#f1c40f", linewidth=1.2, label=plan.ema_fast_label)
+    ax.plot(xs, [v if v is not None else float("nan") for v in plan.ema_slow], color="#3498db", linewidth=1.2, label=plan.ema_slow_label)
     if plan.high_path:
         ax.plot([x for x, _ in plan.high_path], [y for _, y in plan.high_path], color="#e67e22", linewidth=0.9, linestyle="--", alpha=0.8)
     if plan.low_path:
@@ -180,7 +188,7 @@ def render_png(plan: ChartPlan) -> bytes:
     for x, y, text in plan.rsi_marks[-6:]:
         axr.plot(x, y, marker="o", color="#8e44ad", markersize=3)
     axr.set_ylim(0, 100)
-    axr.set_ylabel("RSI14", fontsize=8)
+    axr.set_ylabel(plan.rsi_label, fontsize=8)
     ticks = list(range(0, n, max(1, n // 8)))
     axr.set_xticks(ticks)
     axr.set_xticklabels([fmt_ist(plan.candles[i].open_time, "%d %b %H:%M") for i in ticks], fontsize=7)

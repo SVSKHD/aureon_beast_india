@@ -4,6 +4,7 @@ from .yaml_models import (
     AnalysisConfig,
     ConfirmationPolicyConfig,
     ContractPolicy,
+    SessionOverridesConfig,
     SessionsConfig,
     SymbolsConfig,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "ConfirmationPolicyConfig",
     "ContractPolicy",
     "EnvSettings",
+    "SessionOverridesConfig",
     "SessionsConfig",
     "SymbolsConfig",
     "load_config",

@@ -204,10 +204,7 @@ class IndicatorRepository:
                        ema_gap, ema_fast_slope, rsi, rsi_direction, atr, volume, open_interest, warmed,
                        ema_fast_period, ema_slow_period, rsi_period, atr_period)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(candle_id) DO UPDATE SET ema_fast = excluded.ema_fast, ema_slow = excluded.ema_slow,
-                       ema_gap = excluded.ema_gap, ema_fast_slope = excluded.ema_fast_slope, rsi = excluded.rsi,
-                       rsi_direction = excluded.rsi_direction, atr = excluded.atr, volume = excluded.volume,
-                       open_interest = excluded.open_interest, warmed = excluded.warmed""",
+                   ON CONFLICT(candle_id) DO NOTHING""",
                 (
                     candle_id, row.symbol, row.security_id, row.expiry_date, row.timeframe.value, to_db(row.open_time),
                     row.ema_fast, row.ema_slow, row.ema_gap, row.ema_fast_slope, row.rsi,
@@ -215,8 +212,10 @@ class IndicatorRepository:
                     1 if row.warmed else 0, row.ema_fast_period, row.ema_slow_period, row.rsi_period, row.atr_period,
                 ),
             )
-            rid = conn.execute("SELECT id FROM indicators WHERE candle_id = ?", (candle_id,)).fetchone()["id"]
-        return IndicatorRow(**{**row.__dict__, "id": int(rid)})
+            stored = conn.execute("SELECT * FROM indicators WHERE candle_id = ?", (candle_id,)).fetchone()
+        # Replay safety: the first analysed values are authoritative (auditable); a replay
+        # with a different warmup window must not silently rewrite them.
+        return self._to_row(stored)
 
     def for_candles(self, candle_ids: list[int]) -> dict[int, IndicatorRow]:
         if not candle_ids:
@@ -295,38 +294,47 @@ class PivotRepository:
 
 # ------------------------------------------------------------------ day frames
 class DayFrameRepository:
+    """Market day frames are DERIVED from stored candles, so replaying the same candles
+    twice yields exactly the same frame (bars, OHLC, closure)."""
+
     def __init__(self, db: Database):
         self.db = db
 
-    def upsert(self, symbol: str, security_id: str, expiry_date: str, timeframe: Timeframe, trading_date: date,
-               candle: Candle, is_closed: bool, structure_context: str | None = None,
-               structure_sequence: str | None = None) -> None:
-        cid = _require_parent(candle.id, "candle")
+    def refresh(self, symbol: str, security_id: str, expiry_date: str, timeframe: Timeframe, trading_date: date,
+                span_start: datetime, span_end: datetime, is_closed: bool, structure_context: str | None = None,
+                structure_sequence: str | None = None) -> None:
         now = to_db(utc_now())
         with self.db.transaction() as conn:
             existing = conn.execute(
-                "SELECT * FROM market_day_frames WHERE security_id = ? AND timeframe = ? AND trading_date = ?",
+                "SELECT id, is_closed FROM market_day_frames WHERE security_id = ? AND timeframe = ? AND trading_date = ?",
                 (security_id, timeframe.value, trading_date.isoformat()),
             ).fetchone()
-            if existing is None:
-                conn.execute(
-                    """INSERT INTO market_day_frames(symbol, security_id, expiry_date, timeframe, trading_date, open, high, low, close,
-                           bars, is_closed, last_candle_id, last_open_time, structure_context, structure_sequence, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)""",
-                    (symbol, security_id, expiry_date, timeframe.value, trading_date.isoformat(), candle.open, candle.high,
-                     candle.low, candle.close, int(is_closed), cid, to_db(candle.open_time), structure_context,
-                     structure_sequence, now),
-                )
-            else:
-                if existing["is_closed"]:
-                    return  # closed frames are frozen
-                conn.execute(
-                    """UPDATE market_day_frames SET high = MAX(high, ?), low = MIN(low, ?), close = ?, bars = bars + 1,
-                           is_closed = ?, last_candle_id = ?, last_open_time = ?, structure_context = COALESCE(?, structure_context),
-                           structure_sequence = COALESCE(?, structure_sequence), updated_at = ? WHERE id = ?""",
-                    (candle.high, candle.low, candle.close, int(is_closed), cid, to_db(candle.open_time),
-                     structure_context, structure_sequence, now, existing["id"]),
-                )
+            if existing is not None and existing["is_closed"]:
+                return  # closed frames are frozen
+            agg = conn.execute(
+                """SELECT COUNT(*) AS bars, MAX(high) AS high, MIN(low) AS low, MIN(open_time) AS first_t, MAX(open_time) AS last_t
+                   FROM candles WHERE security_id = ? AND timeframe = ? AND open_time >= ? AND open_time < ?""",
+                (security_id, timeframe.value, to_db(span_start), to_db(span_end)),
+            ).fetchone()
+            if not agg or not agg["bars"]:
+                return
+            first = conn.execute("SELECT open FROM candles WHERE security_id = ? AND timeframe = ? AND open_time = ?",
+                                 (security_id, timeframe.value, agg["first_t"])).fetchone()
+            last = conn.execute("SELECT id, close FROM candles WHERE security_id = ? AND timeframe = ? AND open_time = ?",
+                                (security_id, timeframe.value, agg["last_t"])).fetchone()
+            conn.execute(
+                """INSERT INTO market_day_frames(symbol, security_id, expiry_date, timeframe, trading_date, open, high, low, close,
+                       bars, is_closed, last_candle_id, last_open_time, structure_context, structure_sequence, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(security_id, timeframe, trading_date) DO UPDATE SET open = excluded.open, high = excluded.high,
+                       low = excluded.low, close = excluded.close, bars = excluded.bars, is_closed = excluded.is_closed,
+                       last_candle_id = excluded.last_candle_id, last_open_time = excluded.last_open_time,
+                       structure_context = COALESCE(excluded.structure_context, market_day_frames.structure_context),
+                       structure_sequence = COALESCE(excluded.structure_sequence, market_day_frames.structure_sequence),
+                       updated_at = excluded.updated_at""",
+                (symbol, security_id, expiry_date, timeframe.value, trading_date.isoformat(), first["open"], agg["high"], agg["low"],
+                 last["close"], int(agg["bars"]), int(is_closed), last["id"], agg["last_t"], structure_context, structure_sequence, now),
+            )
 
     def close_frame(self, security_id: str, timeframe: Timeframe, trading_date: date) -> None:
         with self.db.transaction() as conn:
@@ -420,6 +428,12 @@ class SetupRepository:
         self.db = db
 
     def insert(self, s: Setup) -> Setup:
+        setup, _created = self.insert_or_existing(s)
+        return setup
+
+    def insert_or_existing(self, s: Setup) -> tuple[Setup, bool]:
+        """Idempotent on origin_detection_id: a replayed detection returns the stored setup
+        (whatever its current state) instead of creating a second one."""
         _require_parent(s.origin_detection_id, "origin detection")
         _require_parent(s.origin_candle_id, "origin candle")
         now = to_db(utc_now())
@@ -428,13 +442,21 @@ class SetupRepository:
                 """INSERT INTO setups(symbol, security_id, expiry_date, timeframe, family, direction, state, anchor_price,
                        invalidation_price, origin_detection_id, origin_candle_id, created_open_time, updated_open_time,
                        context_json, closed_at, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(origin_detection_id) DO NOTHING""",
                 (s.symbol, s.security_id, s.expiry_date, s.timeframe.value, s.family, s.direction.value, s.state.value,
                  s.anchor_price, s.invalidation_price, s.origin_detection_id, s.origin_candle_id, to_db(s.created_open_time),
                  to_db(s.updated_open_time), s.context_json, to_db(s.closed_at), now, now),
             )
-            s.id = int(cur.lastrowid)
-        return s
+            if cur.rowcount == 1:
+                s.id = int(cur.lastrowid)
+                return s, True
+            row = conn.execute("SELECT * FROM setups WHERE origin_detection_id = ?", (s.origin_detection_id,)).fetchone()
+        return self._to(row), False
+
+    def by_origin(self, detection_id: int) -> Setup | None:
+        row = self.db.query_one("SELECT * FROM setups WHERE origin_detection_id = ?", (detection_id,))
+        return self._to(row) if row else None
 
     def update_state(self, s: Setup) -> None:
         sid = _require_parent(s.id, "setup")
@@ -452,11 +474,17 @@ class SetupRepository:
         with self.db.transaction() as conn:
             cur = conn.execute(
                 """INSERT INTO setup_events(setup_id, candle_id, detection_id, from_state, to_state, reason, evidence_json,
-                       open_time, created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                       open_time, created_at) VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(setup_id, candle_id, to_state) DO NOTHING""",
                 (ev.setup_id, ev.candle_id, ev.detection_id, ev.from_state.value if ev.from_state else None,
                  ev.to_state.value, ev.reason, ev.evidence_json, to_db(ev.open_time), to_db(utc_now())),
             )
-            ev.id = int(cur.lastrowid)
+            if cur.rowcount == 1:
+                ev.id = int(cur.lastrowid)
+            else:  # replayed transition: keep the original event
+                row = conn.execute("SELECT id FROM setup_events WHERE setup_id = ? AND candle_id = ? AND to_state = ?",
+                                   (ev.setup_id, ev.candle_id, ev.to_state.value)).fetchone()
+                ev.id = int(row["id"])
         return ev
 
     def events(self, setup_id: int, limit: int | None = None) -> list[SetupEvent]:
@@ -480,6 +508,16 @@ class SetupRepository:
         rows = self.db.query(
             "SELECT * FROM setups WHERE security_id = ? AND timeframe = ? AND closed_at IS NULL ORDER BY id",
             (security_id, timeframe.value),
+        )
+        return [self._to(r) for r in rows]
+
+    def open_at(self, security_id: str, timeframe: Timeframe, open_time: datetime) -> list[Setup]:
+        """Setups that were open when the candle at `open_time` was analysed (replay-stable)."""
+        t = to_db(open_time)
+        rows = self.db.query(
+            """SELECT * FROM setups WHERE security_id = ? AND timeframe = ? AND created_open_time <= ?
+               AND (closed_at IS NULL OR updated_open_time >= ?) ORDER BY id""",
+            (security_id, timeframe.value, t, t),
         )
         return [self._to(r) for r in rows]
 
@@ -760,6 +798,56 @@ class MessageRefRepository:
             conn.execute("DELETE FROM discord_message_refs WHERE setup_id = ?", (setup_id,))
 
 
+class MonitorSubscriptionRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def add(self, setup_id: int, discord_user_id: int | str) -> bool:
+        _require_parent(setup_id, "setup")
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO monitor_subscriptions(setup_id, discord_user_id, created_at) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                (setup_id, str(discord_user_id), to_db(utc_now())),
+            )
+            return cur.rowcount == 1
+
+    def users_for(self, setup_id: int) -> list[str]:
+        return [r["discord_user_id"] for r in self.db.query("SELECT discord_user_id FROM monitor_subscriptions WHERE setup_id = ? ORDER BY id", (setup_id,))]
+
+    def all(self) -> dict[int, list[str]]:
+        out: dict[int, list[str]] = {}
+        for r in self.db.query("SELECT setup_id, discord_user_id FROM monitor_subscriptions ORDER BY id"):
+            out.setdefault(int(r["setup_id"]), []).append(r["discord_user_id"])
+        return out
+
+
+class MarketDataGapRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def record(self, symbol: str, security_id: str, timeframe: Timeframe, bucket_open_time: datetime, expected: int, present: int,
+               missing: list[datetime] | tuple[datetime, ...], detected_at: datetime) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO market_data_gaps(symbol, security_id, timeframe, bucket_open_time, expected, present, missing_json, detected_at)
+                   VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(security_id, timeframe, bucket_open_time) DO NOTHING""",
+                (symbol, security_id, timeframe.value, to_db(bucket_open_time), expected, present,
+                 json.dumps([to_db(m) for m in missing]), to_db(detected_at)),
+            )
+
+    def resolve(self, security_id: str, timeframe: Timeframe, bucket_open_time: datetime, resolution: str, resolved_at: datetime) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE market_data_gaps SET resolved_at = ?, resolution = ? WHERE security_id = ? AND timeframe = ? AND bucket_open_time = ?",
+                (to_db(resolved_at), resolution, security_id, timeframe.value, to_db(bucket_open_time)),
+            )
+
+    def unresolved(self, security_id: str | None = None) -> list[sqlite3.Row]:
+        if security_id is None:
+            return self.db.query("SELECT * FROM market_data_gaps WHERE resolved_at IS NULL ORDER BY bucket_open_time")
+        return self.db.query("SELECT * FROM market_data_gaps WHERE resolved_at IS NULL AND security_id = ? ORDER BY bucket_open_time", (security_id,))
+
+
 # ----------------------------------------------------------------- aggregate
 class Repositories:
     """Convenience bundle of all repositories over one Database."""
@@ -780,3 +868,5 @@ class Repositories:
         self.snapshots = SnapshotRepository(db)
         self.outcomes = OutcomeRepository(db)
         self.message_refs = MessageRefRepository(db)
+        self.monitors = MonitorSubscriptionRepository(db)
+        self.gaps = MarketDataGapRepository(db)
