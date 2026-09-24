@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from aureon_mcx.logging_setup import kv
 from aureon_mcx.market.candle import Candle
 from aureon_mcx.market.timeframe import Timeframe
-from aureon_mcx.market.timeutil import IST, ensure_utc, from_epoch, utc_now
+from aureon_mcx.market.timeutil import IST, ensure_utc, floor_to, from_epoch, utc_now
 from aureon_mcx.storage.repositories import Repositories
 
 from .client import DhanHttpClient
 from .errors import DhanApiError, DhanError
+
+if TYPE_CHECKING:
+    from aureon_mcx.market.sessions import SessionCalendar
 
 log = logging.getLogger("aureon.dhan.historical")
 
@@ -107,21 +110,86 @@ class DhanHistoricalProvider:
         return [dedup[k] for k in sorted(dedup)]
 
 
-class CachedHistoricalProvider:
-    """Never downloads the same range twice: candles + covered ranges live in SQLite."""
+def verified_coverage(candles: list[Candle], timeframe: Timeframe, start: datetime, end: datetime, *,
+                      calendar: "SessionCalendar | None" = None, now: datetime | None = None,
+                      tz=IST) -> list[tuple[datetime, datetime]]:
+    """Intervals of [start, end) that ``candles`` provably cover.
 
-    def __init__(self, provider: HistoricalProvider, repos: Repositories, archive=None):
+    ``potential`` = every timeframe-aligned open inside the range at which the market
+    is open (all aligned opens when no calendar is given); ``expected`` = the potential
+    bars that have already closed at ``now``.  A maximal run of consecutive expected
+    bars that are all present yields one interval.  The interval may stretch to
+    ``start`` / ``end`` only when nothing else could ever be expected there (closed
+    market), never across a bar that is still open or that the broker did not return.
+    Fabrication is impossible: an empty response over an open market covers nothing.
+    """
+    start, end = ensure_utc(start), ensure_utc(end)
+    now = ensure_utc(now or utc_now())
+    if end <= start:
+        return []
+    step = timedelta(seconds=timeframe.seconds)
+    potential: list[datetime] = []
+    t = floor_to(start, timeframe.seconds, tz)
+    if t < start:
+        t += step
+    while t < end:
+        if calendar is None or calendar.is_open(t):
+            potential.append(t)
+        t += step
+    if not potential:
+        return [(start, end)]  # nothing can ever exist here (holiday / closed hours)
+    expected = [t for t in potential if t + step <= now]
+    if not expected:
+        return []
+    present = {ensure_utc(c.open_time) for c in candles if c.timeframe is timeframe}
+    out: list[tuple[datetime, datetime]] = []
+    i = 0
+    while i < len(expected):
+        if expected[i] not in present:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(expected) and expected[j + 1] in present:
+            j += 1
+        s = start if i == 0 else expected[i]
+        e = end if expected[j] == potential[-1] else expected[j] + step
+        out.append((s, e))
+        i = j + 1
+    return out
+
+
+class CachedHistoricalProvider:
+    """Downloads only what verified coverage lacks; candles + coverage live in SQLite.
+
+    Coverage is recorded from what the broker actually returned (``verified_coverage``),
+    never from the requested range, so a partial / empty / truncated response leaves
+    the missing part uncovered and it is re-requested next time.
+    """
+
+    def __init__(self, provider: HistoricalProvider, repos: Repositories, archive=None,
+                 calendar: "SessionCalendar | None" = None, now=utc_now):
         self.provider = provider
         self.repos = repos
         self.archive = archive
+        self.calendar = calendar
+        self._now = now
 
     def load(self, symbol: str, security_id: str, exchange_segment: str, instrument_type: str, expiry_date: str,
              timeframe: Timeframe, start: datetime, end: datetime) -> list[Candle]:
         start, end = ensure_utc(start), ensure_utc(end)
-        if not self.repos.historical_cache.is_cached(security_id, timeframe, start, end):
-            fetched = self.provider.fetch(symbol, security_id, exchange_segment, instrument_type, expiry_date, timeframe, start, end)
+        for gap_start, gap_end in self.repos.historical_cache.uncovered(security_id, timeframe, start, end):
+            fetched = self.provider.fetch(symbol, security_id, exchange_segment, instrument_type, expiry_date, timeframe,
+                                          gap_start, gap_end)
+            fetched = [c for c in fetched if gap_start <= ensure_utc(c.open_time) < gap_end]
             stored = self.repos.candles.insert_many(fetched)
             if self.archive is not None and stored:
                 self.archive.archive(stored)
-            self.repos.historical_cache.record(security_id, timeframe, start, end, len(stored))
+            covered = verified_coverage(stored, timeframe, gap_start, gap_end, calendar=self.calendar, now=self._now())
+            for s, e in covered:
+                self.repos.historical_cache.record(security_id, timeframe, s, e, sum(1 for c in stored if s <= c.open_time < e))
+            missing = self.repos.historical_cache.uncovered(security_id, timeframe, gap_start, gap_end)
+            if missing:
+                log.warning("historical_coverage_incomplete %s",
+                            kv(symbol=symbol, security_id=security_id, timeframe=timeframe.value, bars=len(stored),
+                               missing=";".join(f"{a.isoformat()}..{b.isoformat()}" for a, b in missing[:5]), gaps=len(missing)))
         return self.repos.candles.range(security_id, timeframe, start, end)

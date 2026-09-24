@@ -17,7 +17,7 @@ from aureon_mcx.detection.models import Detection, DetectionFamily, Direction
 from aureon_mcx.indicators.models import IndicatorRow, RsiDirection
 from aureon_mcx.market.candle import Candle
 from aureon_mcx.market.timeframe import Timeframe
-from aureon_mcx.market.timeutil import from_db, to_db, utc_now
+from aureon_mcx.market.timeutil import ensure_utc, from_db, to_db, utc_now
 from aureon_mcx.outcomes.models import FeatureSnapshot, OutcomeObservation
 from aureon_mcx.setups.models import Setup, SetupEvent, SetupState
 from aureon_mcx.structure.models import Pivot, PivotKind, StructureLabel
@@ -169,26 +169,79 @@ class CandleRepository:
 
 
 class HistoricalCacheRepository:
+    """Verified coverage intervals per (security_id, timeframe).
+
+    A row means "every bar the exchange calendar expects inside [range_start, range_end)
+    is stored in ``candles``".  Rows are recorded from what the broker actually returned
+    (see ``CachedHistoricalProvider``), never from what was merely requested, so a
+    partial or empty response can never poison later loads.  Overlapping / adjacent
+    rows are merged on write; ``is_cached`` therefore answers from merged coverage.
+    """
+
     def __init__(self, db: Database):
         self.db = db
 
-    def is_cached(self, security_id: str, timeframe: Timeframe, start: datetime, end: datetime) -> bool:
-        row = self.db.query_one(
-            """SELECT 1 FROM historical_cache_ranges
-               WHERE security_id = ? AND timeframe = ? AND range_start <= ? AND range_end >= ? LIMIT 1""",
-            (security_id, timeframe.value, to_db(start), to_db(end)),
+    def coverage(self, security_id: str, timeframe: Timeframe) -> list[tuple[datetime, datetime]]:
+        rows = self.db.query(
+            "SELECT range_start, range_end FROM historical_cache_ranges WHERE security_id = ? AND timeframe = ? ORDER BY range_start",
+            (security_id, timeframe.value),
         )
-        return row is not None
+        return merge_intervals([(from_db(r["range_start"]), from_db(r["range_end"])) for r in rows])
+
+    def is_cached(self, security_id: str, timeframe: Timeframe, start: datetime, end: datetime) -> bool:
+        start, end = ensure_utc(start), ensure_utc(end)
+        if end <= start:
+            return True
+        return any(s <= start and e >= end for s, e in self.coverage(security_id, timeframe))
+
+    def uncovered(self, security_id: str, timeframe: Timeframe, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+        """Sub-ranges of [start, end) that verified coverage does not contain."""
+        start, end = ensure_utc(start), ensure_utc(end)
+        gaps: list[tuple[datetime, datetime]] = []
+        cursor = start
+        for s, e in self.coverage(security_id, timeframe):
+            if e <= cursor:
+                continue
+            if s >= end:
+                break
+            if s > cursor:
+                gaps.append((cursor, s))
+            cursor = max(cursor, e)
+            if cursor >= end:
+                break
+        if cursor < end:
+            gaps.append((cursor, end))
+        return gaps
 
     def record(self, security_id: str, timeframe: Timeframe, start: datetime, end: datetime, bars: int) -> None:
+        start, end = ensure_utc(start), ensure_utc(end)
+        if end <= start:
+            return
         with self.db.transaction() as conn:
-            conn.execute(
+            rows = conn.execute(
+                "SELECT range_start, range_end, bars FROM historical_cache_ranges WHERE security_id = ? AND timeframe = ?",
+                (security_id, timeframe.value),
+            ).fetchall()
+            intervals = [(from_db(r["range_start"]), from_db(r["range_end"]), int(r["bars"])) for r in rows] + [(start, end, bars)]
+            merged = merge_intervals([(s, e) for s, e, _ in intervals])
+            counts = {(s, e): sum(b for s2, e2, b in intervals if s <= s2 and e2 <= e) for s, e in merged}
+            conn.execute("DELETE FROM historical_cache_ranges WHERE security_id = ? AND timeframe = ?", (security_id, timeframe.value))
+            conn.executemany(
                 """INSERT INTO historical_cache_ranges(security_id, timeframe, range_start, range_end, bars, downloaded_at)
-                   VALUES (?,?,?,?,?,?)
-                   ON CONFLICT(security_id, timeframe, range_start, range_end) DO UPDATE SET bars = excluded.bars,
-                   downloaded_at = excluded.downloaded_at""",
-                (security_id, timeframe.value, to_db(start), to_db(end), bars, to_db(utc_now())),
+                   VALUES (?,?,?,?,?,?)""",
+                [(security_id, timeframe.value, to_db(s), to_db(e), counts[(s, e)], to_db(utc_now())) for s, e in merged],
             )
+
+
+def merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    """Merge overlapping or touching half-open [start, end) intervals."""
+    out: list[tuple[datetime, datetime]] = []
+    for s, e in sorted(i for i in intervals if i[1] > i[0]):
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
 
 
 # ------------------------------------------------------------------- indicators

@@ -578,6 +578,71 @@ def test_supervisor_restarts_failed_feed_and_degrades_discord(tmp_path, monkeypa
     assert "discord=error" in app.health.status_line() or "discord=restarting" in app.health.status_line()
 
 
+def test_supervisor_restarts_tasks_that_return_normally_while_running(tmp_path, monkeypatch):
+    """A supervised loop that *returns* (no exception) while stop is not set is a silent
+    failure: the feed stops delivering ticks, the flush loop stops closing candles.  The
+    supervisor must restart it exactly as it would after a crash."""
+    monkeypatch.setenv("DISCORD_TOKEN", "d-token")
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", "1")
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 3, "ids": ("428291",)})
+    app.task_backoff_scale = 0.01
+    app.startup()
+    attempts = {"feed": 0, "flush": 0}
+
+    class QuietlyReturningFeed(FakeFeed):
+        async def run(self, stop):
+            attempts["feed"] += 1
+            if attempts["feed"] == 1:
+                return  # socket loop ended without raising - the feed is now silent
+            await super().run(stop)
+
+    def feed_factory(cfg, on_tick, health):
+        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",))
+        feeds.append(f)
+        return f
+
+    real_flush = app._flush_loop
+
+    async def flush_that_returns_once():
+        attempts["flush"] += 1
+        if attempts["flush"] == 1:
+            return
+        await real_flush()
+
+    class QuietDiscord:
+        def __init__(self):
+            self.starts = 0
+
+        async def start(self, token):
+            self.starts += 1  # gateway closed without an exception
+
+        def is_closed(self):
+            return True
+
+        async def close(self):
+            pass
+
+    quiet = QuietDiscord()
+    app._feed_factory = feed_factory
+    app._flush_loop = flush_that_returns_once
+    app._sink_factory = lambda cfg, repos: (NullSink(), quiet)
+    asyncio.run(app.run())
+    assert attempts["feed"] == 2 and attempts["flush"] == 2  # both restarted after returning early
+    assert ("feed", "TaskExited") in app.task_failures and ("flush", "TaskExited") in app.task_failures
+    assert quiet.starts >= 2
+    assert app.observers["GOLD"].closed_count > 0 and app.health.symbols["GOLD"].state == "LIVE"  # observation continued
+    assert app.health.components["discord"].status in ("error", "restarting")
+
+
+def test_supervisor_ignores_normal_returns_at_shutdown(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 2, "ids": ("428291",)})
+    app.task_backoff_scale = 0.01
+    app.startup()
+    asyncio.run(app.run())
+    assert app.stop.is_set()
+    assert not any(kind == "TaskExited" for _, kind in app.task_failures)  # orderly exits are not failures
+
+
 def test_critical_task_repeated_failure_shuts_down_safely(tmp_path, monkeypatch):
     app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
     app.task_backoff_scale = 0.01

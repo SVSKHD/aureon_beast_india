@@ -210,7 +210,7 @@ class Application:
         # 8 / 9 historical + warm (per symbol, via the same routine used by rollover)
         archive = ParquetArchive(cfg.env.AUREON_PARQUET_DIR, cfg.env.AUREON_PARQUET_ARCHIVE)
         self.historical = self._historical_factory(cfg, self.http)
-        self._cached = CachedHistoricalProvider(self.historical, self.repos, archive)
+        self._cached = CachedHistoricalProvider(self.historical, self.repos, archive, calendar=self.calendar, now=self._now)
         self.continuity = ContinuityService(self.historical, self.repos, self.calendar, self.health, self._now, cfg.primary_timeframe,
                                             allow_zero_trade_fill=cfg.analysis.historical.allow_verified_zero_trade_fill,
                                             retries=cfg.analysis.historical.verification_retries)
@@ -500,16 +500,25 @@ class Application:
     async def _handle_task_exit(self, task: asyncio.Task) -> None:
         name = task.get_name()
         spec = self._specs.get(name)
-        exc = None if task.cancelled() else task.exception()
+        if task.cancelled():
+            return
+        stopping = self.stop is None or self.stop.is_set()
+        exc = task.exception()
+        if exc is None and (stopping or spec is None):
+            return  # orderly exit at shutdown (or an unsupervised task): nothing to do
         if exc is None:
-            if self.stop is not None and not self.stop.is_set() and spec is not None:
-                log.warning("task_exited %s", kv(task=name))
-            return
-        self.task_failures.append((name, type(exc).__name__))
-        log.error("task_failed %s", kv(task=name, error=type(exc).__name__, detail=str(exc)[:200]), exc_info=exc)
-        if spec is None:
-            return
-        self.health.set(name, "error", f"{type(exc).__name__}: {str(exc)[:120]}")
+            # A supervised loop returned while the application is still running.  A feed
+            # that "finishes" is a silent feed; a flush loop that finishes never closes a
+            # candle again.  Treat it exactly like a crash so it is restarted / escalated.
+            self.task_failures.append((name, "TaskExited"))
+            log.error("task_exited %s", kv(task=name, detail="returned while application running"))
+            self.health.set(name, "error", "exited unexpectedly")
+        else:
+            self.task_failures.append((name, type(exc).__name__))
+            log.error("task_failed %s", kv(task=name, error=type(exc).__name__, detail=str(exc)[:200]), exc_info=exc)
+            if spec is None:
+                return
+            self.health.set(name, "error", f"{type(exc).__name__}: {str(exc)[:120]}")
         if spec.restarts >= spec.max_restarts:
             if spec.critical:
                 log.critical("task_restart_limit %s", kv(task=name, restarts=spec.restarts))
