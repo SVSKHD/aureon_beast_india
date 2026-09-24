@@ -159,7 +159,8 @@ class SymbolObserver:
             return
         # MTF changed: re-evaluate clearance for open setups (no lifecycle evaluation on a higher-tf bar)
         for setup in self.repos.setups.open_for(self.security_id, self.primary):
-            self._clear_and_publish(setup, last_primary, ind, publish)
+            if setup.updated_open_time <= last_primary.open_time:
+                self._clear_and_publish(setup, last_primary, ind, publish)
 
     # ------------------------------------------------------------- primary
     def _on_primary(self, candle: Candle, ind: IndicatorRow, upd, publish: bool) -> None:
@@ -177,9 +178,10 @@ class SymbolObserver:
         tol = self.cfg.analysis.liquidity.equal_level_tolerance_atr * (ind.atr or 0.0)
         levels = build_levels(structure.all_pivots, pdh, pdl, sh, sl, tol)
         # day frame + session trend
-        self.repos.day_frames.upsert(self.symbol, self.security_id, self.expiry, tf, trading_date, candle,
-                                     self.calendar.trading_day_closed(trading_date, candle.close_time),
-                                     structure.context().value, structure.sequence())
+        span_start, span_end = self.calendar.trading_day_span(trading_date)
+        self.repos.day_frames.refresh(self.symbol, self.security_id, self.expiry, tf, trading_date, span_start, span_end,
+                                      self.calendar.trading_day_closed(trading_date, candle.close_time),
+                                      structure.context().value, structure.sequence())
         for row in self.sessions.update(candle, ind):
             self.repos.session_state.upsert(row.to_record(self.symbol, self.security_id))
         # detections
@@ -209,25 +211,33 @@ class SymbolObserver:
         # context
         self.present = present_trend(list(self.candles[tf]), ind, structure.context(), self.cfg.sessions.trend.present_lookback_bars,
                                      self.cfg.sessions.trend.min_move_atr).direction
-        # lifecycle for existing setups
-        open_setups = self.repos.setups.open_for(self.security_id, tf)
+        # lifecycle for existing setups (replay safety: a setup is only evaluated by candles at
+        # or after its last update; older candles belong to an already-audited past)
+        open_setups = [s for s in self.repos.setups.open_for(self.security_id, tf) if s.updated_open_time <= candle.open_time]
         for setup in open_setups:
             for t in self.tracker.evaluate(setup, candle, ind):
                 self.repos.setups.update_state(setup)
                 self.repos.setups.add_event(SetupEvent(setup.id, candle.id, t.from_state, t.to_state, t.reason, t.evidence, candle.open_time))
                 log.info("setup_transition %s", kv(symbol=self.symbol, setup_id=setup.id, from_state=t.from_state.value,
                                                   to_state=t.to_state.value, reason=t.reason, open_time=fmt_ist(candle.open_time)))
-        # new setups from this candle's detections (evaluated from the next candle)
+        # new setups from this candle's detections (evaluated from the next candle). The
+        # same-anchor dedupe looks at setups that were open AT THIS CANDLE (replay-stable).
+        open_at_candle = self.repos.setups.open_at(self.security_id, tf, candle.open_time)
         for d in stored_dets:
             created = create_setup(d, candle, ind)
             if created is None:
                 continue
             setup, t = created
             if any(s.family == setup.family and s.direction == setup.direction and abs(s.anchor_price - setup.anchor_price) <= 1e-9
-                   for s in open_setups):
+                   and s.origin_detection_id != d.id for s in open_at_candle):
                 continue
             setup.state = t.to_state
-            self.repos.setups.insert(setup)
+            setup, created = self.repos.setups.insert_or_existing(setup)
+            if not created:
+                # replay / restart: the originating detection already produced this setup
+                if not setup.state.is_terminal and all(s.id != setup.id for s in open_setups):
+                    open_setups.append(setup)
+                continue
             self.repos.setups.add_event(SetupEvent(setup.id, candle.id, t.from_state, t.to_state, t.reason, t.evidence, candle.open_time, d.id))
             open_setups.append(setup)
             log.info("setup_created %s", kv(symbol=self.symbol, setup_id=setup.id, family=setup.family, direction=setup.direction.value,
