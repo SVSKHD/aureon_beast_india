@@ -755,6 +755,10 @@ class MessageRefRepository:
     def all(self) -> list[sqlite3.Row]:
         return self.db.query("SELECT * FROM discord_message_refs ORDER BY setup_id")
 
+    def delete(self, setup_id: int) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM discord_message_refs WHERE setup_id = ?", (setup_id,))
+
 
 # ----------------------------------------------------------------- aggregate
 class Repositories:

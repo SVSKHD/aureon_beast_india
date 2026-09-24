@@ -29,6 +29,8 @@ class OutcomeService:
         self.cfg = analysis
         self.calendar = calendar
         self.horizons: list[Horizon] = horizons_from_config(analysis.horizons.bars, analysis.horizons.include_session)
+        self._bars_final: set[int] = set()
+        self._session_seen: set[int] = set()
 
     @property
     def max_bars(self) -> int:
@@ -40,28 +42,52 @@ class OutcomeService:
             return existing
         return self.repos.snapshots.insert(build_snapshot(detection, candle, ind, context, setup_family))
 
-    def update_pending(self, security_id: str, now: datetime, limit: int = 200) -> int:
-        """Recompute observations for pending snapshots using only closed candles after the detection candle."""
+    def update_pending(self, security_id: str, now: datetime, limit: int = 500) -> int:
+        """Incrementally recompute observations for pending snapshots.
+
+        Bar horizons are recomputed only while the snapshot is younger than the
+        longest bar horizon; the session horizon is computed once as pending and
+        finalised when the trading day closes. Inputs are only CLOSED candles
+        strictly after the detection candle.
+        """
         updated = 0
         for snap in self.repos.snapshots.pending_outcomes(limit):
-            if snap.security_id != security_id:
+            if snap.security_id != security_id or snap.id is None:
                 continue
             session_date = self.calendar.trading_date(snap.open_time)
             _, session_end = self.calendar.trading_day_span(session_date)
-            session_bars = int((session_end - snap.open_time).total_seconds() // snap.timeframe.seconds) + 2
-            future = self.repos.candles.after(security_id, snap.timeframe, snap.open_time, max(self.max_bars, session_bars))
+            day_closed = self.calendar.trading_day_closed(session_date, now)
+            bars_final = snap.id in self._bars_final
+            session_seen = snap.id in self._session_seen
+            if bars_final and session_seen and not day_closed:
+                continue
+            need_session = day_closed or not session_seen
+            if need_session:
+                session_bars = int((session_end - snap.open_time).total_seconds() // snap.timeframe.seconds) + 2
+                future = self.repos.candles.after(security_id, snap.timeframe, snap.open_time, max(self.max_bars, session_bars))
+            else:
+                future = self.repos.candles.after(security_id, snap.timeframe, snap.open_time, self.max_bars)
             if not future:
                 continue
-            setup_invalidated = self._setup_invalidated(snap)
-            obs = observe(snap, future, self.horizons, self.cfg.outcomes.follow_through_atr, self.cfg.outcomes.invalidation_atr,
-                          session_end=session_end, session_closed=self.calendar.trading_day_closed(session_date, now),
-                          setup_invalidated=setup_invalidated)
+            horizons = [h for h in self.horizons if (h.bars is not None and not bars_final) or (h.bars is None and need_session)]
+            obs = observe(snap, future, horizons, self.cfg.outcomes.follow_through_atr, self.cfg.outcomes.invalidation_atr,
+                          session_end=session_end, session_closed=day_closed, setup_invalidated=self._setup_invalidated(snap))
             for o in obs:
                 self.repos.outcomes.upsert(o)
             updated += 1
-            if obs and all(o.is_final for o in obs) and len(obs) == len(self.horizons):
-                self.repos.outcomes.mark_all_final(snap.id, snap.detection_id, obs[-1].last_candle_open_time)  # type: ignore[arg-type]
-                log.info("outcome_final %s", kv(snapshot_id=snap.id, detection_id=snap.detection_id, labels=",".join(o.label for o in obs)))
+            bar_obs = [o for o in obs if o.horizon != "session"]
+            if not bars_final and bar_obs and all(o.is_final for o in bar_obs) and len(bar_obs) == len(self.cfg.horizons.bars):
+                self._bars_final.add(snap.id)
+            if need_session:
+                self._session_seen.add(snap.id)
+            session_obs = [o for o in obs if o.horizon == "session"]
+            session_done = (not self.cfg.horizons.include_session) or (bool(session_obs) and session_obs[0].is_final)
+            if snap.id in self._bars_final and session_done:
+                self.repos.outcomes.mark_all_final(snap.id, snap.detection_id, future[-1].open_time)
+                self._bars_final.discard(snap.id)
+                self._session_seen.discard(snap.id)
+                log.info("outcome_final %s", kv(snapshot_id=snap.id, detection_id=snap.detection_id,
+                                                labels=",".join(o.label for o in self.repos.outcomes.for_snapshot(snap.id))))
         return updated
 
     def _setup_invalidated(self, snap: FeatureSnapshot) -> bool:

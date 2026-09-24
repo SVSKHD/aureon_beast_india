@@ -92,6 +92,7 @@ class SymbolObserver:
         self.current_trading_date: date | None = None
         self.published_hashes: dict[int, str] = {}
         self.closed_count = 0
+        self._cohort_cache: dict[tuple, tuple[datetime, list[str] | None]] = {}
 
     # ------------------------------------------------------------------ helpers
     def _structure_ctx(self, tf: Timeframe) -> StructureContext:
@@ -290,13 +291,7 @@ class SymbolObserver:
                   for e in self.repos.setups.events(setup.id)]
         refs = [f"detection #{setup.origin_detection_id} · {setup.context.get('origin_label', '')}"]
         refs += [f"event #{e['id']} · {e['to_state']} · {fmt_ist(e['open_time'], '%d %b %H:%M')}" for e in events[-5:]]
-        cohort_lines = None
-        snaps = self.repos.snapshots.cohort(self.symbol, setup.family, setup.direction.value, self.primary)
-        if snaps:
-            horizon = f"{self.cfg.analysis.horizons.bars[-1]}b"
-            obs = self.repos.outcomes.cohort([s.id for s in snaps if s.id], horizon)
-            stats = cohort_stats(obs, horizon, self.cfg.analysis.outcomes.min_cohort_sample)
-            cohort_lines = stats.lines() if stats else None
+        cohort_lines = self._cohort_lines(setup.family, setup.direction.value, candle.open_time)
         ema_rel = "n/a"
         if ind.ema_fast is not None and ind.ema_slow is not None:
             ema_rel = "EMA20 > EMA50" if ind.ema_fast > ind.ema_slow else ("EMA20 < EMA50" if ind.ema_fast < ind.ema_slow else "EMA20 = EMA50")
@@ -319,6 +314,21 @@ class SymbolObserver:
             fakeout_flags=list(clearance.fakeout_flags), blockers=list(clearance.blockers), cleared=clearance.cleared,
             policy_version=clearance.policy_version, detection_refs=refs, cohort_lines=cohort_lines, is_terminal=setup.state.is_terminal,
         )
+
+    def _cohort_lines(self, family: str, direction: str, open_time: datetime) -> list[str] | None:
+        key = (family, direction)
+        cached = self._cohort_cache.get(key)
+        if cached is not None and cached[0] == open_time:
+            return cached[1]
+        lines = None
+        snaps = self.repos.snapshots.cohort(self.symbol, family, direction, self.primary)
+        if snaps:
+            horizon = f"{self.cfg.analysis.horizons.bars[-1]}b"
+            obs = self.repos.outcomes.cohort([s.id for s in snaps if s.id], horizon)
+            stats = cohort_stats(obs, horizon, self.cfg.analysis.outcomes.min_cohort_sample)
+            lines = stats.lines() if stats else None
+        self._cohort_cache[key] = (open_time, lines)
+        return lines
 
     # ---------------------------------------------------------------- warmup
     def warm(self, history: dict[Timeframe, list[Candle]]) -> dict[Timeframe, int]:
