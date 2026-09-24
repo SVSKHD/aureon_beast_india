@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from aureon_mcx.market.timeframe import Timeframe
 
 from .env import EnvSettings
-from .yaml_models import AnalysisConfig, ConfirmationPolicyConfig, SessionsConfig, SymbolsConfig
+from .yaml_models import AnalysisConfig, ConfirmationPolicyConfig, SessionOverridesConfig, SessionsConfig, SymbolsConfig
 
 
 class ConfigError(RuntimeError):
@@ -80,6 +80,10 @@ def load_config(config_dir: str | os.PathLike | None = None, env_file: str | os.
     cdir = Path(config_dir) if config_dir is not None else Path(env.AUREON_CONFIG_DIR)
     symbols = _validate(SymbolsConfig, _read_yaml(cdir / "symbols.yaml"), cdir / "symbols.yaml")
     sessions = _validate(SessionsConfig, _read_yaml(cdir / "sessions.yaml"), cdir / "sessions.yaml")
+    overrides_path = cdir / "session_overrides.yaml"
+    if overrides_path.exists():
+        overrides = _validate(SessionOverridesConfig, _read_yaml(overrides_path), overrides_path)
+        sessions = sessions.model_copy(update={"overrides": overrides})
     policy = _validate(ConfirmationPolicyConfig, _read_yaml(cdir / "confirmation_policy.yaml"), cdir / "confirmation_policy.yaml")
     analysis_path = cdir / "analysis.yaml"
     analysis = _validate(AnalysisConfig, _read_yaml(analysis_path) if analysis_path.exists() else {}, analysis_path)
