@@ -101,7 +101,7 @@ def test_snapshot_has_no_future_features_and_is_immutable(repos):
     ctx = {"present_trend": "BULLISH", "mtf_state": "MTF ALIGNED", "structure_context": "BULLISH", "structure_sequence": "HL -> HH"}
     snap = build_snapshot(det, c, ind, ctx, "breakout")
     f = snap.features
-    assert f["ema20"] == 101.0 and f["rsi"] == 56.0 and f["present_trend"] == "BULLISH" and f["timestamp"] == c.open_time.isoformat()
+    assert f["ema_fast"] == 101.0 and f["ema_fast_period"] == 20 and f["rsi"] == 56.0 and f["present_trend"] == "BULLISH" and f["timestamp"] == c.open_time.isoformat()
     assert f["feature_schema_version"] == FEATURE_SCHEMA_VERSION and f["contract_expiry"] == "2026-10-05"
     # no key refers to anything after the detection candle
     assert not any(k.startswith(("future", "outcome", "mfe", "mae", "label")) for k in f)

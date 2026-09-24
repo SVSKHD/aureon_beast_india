@@ -286,7 +286,7 @@ class MtfSpec(StrictModel):
 class DeclutterSpec(StrictModel):
     max_labeled_detections: int = Field(default=4, ge=0)
     max_labeled_setup_events: int = Field(default=3, ge=0)
-    context_panel_lines: int = Field(default=8, ge=1)
+    context_panel_lines: int = Field(default=10, ge=1)
     chart_bars: int = Field(default=120, ge=20)
 
 

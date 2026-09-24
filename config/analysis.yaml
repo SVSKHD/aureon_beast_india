@@ -39,7 +39,7 @@ mtf:
 declutter:
   max_labeled_detections: 4
   max_labeled_setup_events: 3
-  context_panel_lines: 8
+  context_panel_lines: 10
   chart_bars: 120
 
 horizons:

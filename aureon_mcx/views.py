@@ -63,6 +63,27 @@ class SetupView:
     detection_refs: list[str] = field(default_factory=list)
     cohort_lines: list[str] | None = None
     is_terminal: bool = False
+    # configured indicator periods (presentation must never hard-code EMA20/EMA50/RSI14)
+    ema_fast_period: int = 20
+    ema_slow_period: int = 50
+    rsi_period: int = 14
+    atr_period: int = 14
+
+    @property
+    def ema_fast_name(self) -> str:
+        return f"EMA{self.ema_fast_period}"
+
+    @property
+    def ema_slow_name(self) -> str:
+        return f"EMA{self.ema_slow_period}"
+
+    @property
+    def rsi_name(self) -> str:
+        return f"RSI{self.rsi_period}"
+
+    @property
+    def atr_name(self) -> str:
+        return f"ATR{self.atr_period}"
 
     @property
     def final_check(self) -> str:

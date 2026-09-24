@@ -72,9 +72,9 @@ def build_card(view: SetupView) -> CardSpec:
     sections.append(CardSection(SECTION_ORDER[1], trend_body))
     # 3 · MOMENTUM
     mom_body = "\n".join([
-        f"EMA20: {_fmt(view.ema_fast)} · EMA50: {_fmt(view.ema_slow)} · {view.ema_relation}",
+        f"{view.ema_fast_name}: {_fmt(view.ema_fast)} · {view.ema_slow_name}: {_fmt(view.ema_slow)} · {view.ema_relation}",
         f"Early EMA: {view.early_ema or 'none'}", f"Latest EMA cross: {view.latest_cross or 'none'}",
-        f"RSI14: {_fmt(view.rsi)} ({view.rsi_direction or 'n/a'}) · ATR14: {_fmt(view.atr, 2)}",
+        f"{view.rsi_name}: {_fmt(view.rsi)} ({view.rsi_direction or 'n/a'}) · {view.atr_name}: {_fmt(view.atr, 2)}",
         f"Volume: {_fmt(view.volume, 0)} · OI: {_fmt(view.open_interest, 0)}"])
     sections.append(CardSection(SECTION_ORDER[2], mom_body))
     # 4 · CONFIRMATION EVIDENCE

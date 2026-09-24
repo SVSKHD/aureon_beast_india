@@ -5,14 +5,24 @@
 * rollover: `replace_subscription(old, new)` unsubscribes old / subscribes new
 * emits Tick objects only; candle building happens in market.candle_builder
 
-Binary packet layout (little-endian) per Dhan v2 docs:
-  header  : <B H B I>  response_code, message_length, exchange_segment, security_id
-  ticker  : <f I>      ltp, ltt                          (code 2)
-  quote   : <f h I f I I I f f f f>                      (code 4)
-  oi      : <I>        open_interest                     (code 5)
-  prev cls: <f I>      prev_close, prev_oi               (code 6)
-  full    : quote + oi + ... (code 8) - parsed for ltp/ltt/volume/oi
-  disconn : <h>        reason code                       (code 50)
+Binary packet layouts (little-endian) per the DhanHQ v2 "Live Market Feed" spec.
+Absolute byte offsets, header included:
+
+  header (8)      : 0 response code B | 1 message length H | 3 exchange segment B | 4 security id I
+  ticker  (16)    : 8 LTP f | 12 LTT I
+  quote   (50)    : 8 LTP f | 12 LTQ h | 14 LTT I | 18 ATP f | 22 volume I | 26 total sell qty I |
+                    30 total buy qty I | 34 open f | 38 close f | 42 high f | 46 low f
+  oi      (12)    : 8 OI I
+  prev cl (16)    : 8 prev close f | 12 prev OI I
+  status  (8)     : header only
+  full    (162)   : 8 LTP f | 12 LTQ h | 14 LTT I | 18 ATP f | 22 volume I | 26 total sell qty I |
+                    30 total buy qty I | 34 OI I | 38 OI day high I | 42 OI day low I | 46 open f |
+                    50 close f | 54 high f | 58 low f | 62.. 5 depth levels x 20 bytes
+                    (bid qty I, ask qty I, bid orders h, ask orders h, bid price f, ask price f)
+  disconn (10)    : 8 reason h
+
+The Quote and Full layouts share only their first 34 bytes; Full inserts the three OI
+fields BEFORE the day OHLC, so the two are parsed with separate structs.
 """
 from __future__ import annotations
 
@@ -20,7 +30,7 @@ import asyncio
 import json
 import logging
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Protocol
 
 from aureon_mcx.logging_setup import kv
@@ -40,6 +50,28 @@ MAX_INSTRUMENTS_PER_REQUEST = 100
 
 CODE_TICKER, CODE_QUOTE, CODE_OI, CODE_PREV_CLOSE, CODE_MARKET_STATUS, CODE_FULL, CODE_DISCONNECT = 2, 4, 5, 6, 7, 8, 50
 
+HEADER = struct.Struct("<BHBI")                     # 8 bytes
+TICKER = struct.Struct("<fI")                       # 8 bytes  -> 16 total
+QUOTE = struct.Struct("<fhIfIIIffff")               # 42 bytes -> 50 total
+OI = struct.Struct("<I")                            # 4 bytes  -> 12 total
+PREV_CLOSE = struct.Struct("<fI")                   # 8 bytes  -> 16 total
+FULL_HEAD = struct.Struct("<fhIfIIIIIIffff")        # 54 bytes -> 62, then depth
+DEPTH_LEVEL = struct.Struct("<IIhhff")              # 20 bytes x 5 -> 162 total
+DISCONNECT = struct.Struct("<h")                    # 2 bytes  -> 10 total
+
+PACKET_SIZES = {CODE_TICKER: 16, CODE_QUOTE: 50, CODE_OI: 12, CODE_PREV_CLOSE: 16, CODE_MARKET_STATUS: 8,
+                CODE_FULL: 8 + FULL_HEAD.size + 5 * DEPTH_LEVEL.size, CODE_DISCONNECT: 10}
+
+
+@dataclass(frozen=True)
+class DepthLevel:
+    bid_qty: int
+    ask_qty: int
+    bid_orders: int
+    ask_orders: int
+    bid_price: float
+    ask_price: float
+
 
 @dataclass(frozen=True)
 class FeedPacket:
@@ -49,34 +81,58 @@ class FeedPacket:
     ltp: float | None = None
     ltt: int | None = None
     last_qty: float | None = None
+    atp: float | None = None
     volume: float | None = None
+    total_sell_qty: int | None = None
+    total_buy_qty: int | None = None
+    day_open: float | None = None
+    day_close: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
     open_interest: float | None = None
+    oi_day_high: float | None = None
+    oi_day_low: float | None = None
+    prev_close: float | None = None
+    prev_open_interest: float | None = None
+    depth: tuple[DepthLevel, ...] = field(default_factory=tuple)
     disconnect_reason: int | None = None
 
 
 def parse_packet(data: bytes) -> FeedPacket | None:
-    if len(data) < 8:
+    """Parse one binary feed packet. Returns None for truncated / unknown packets."""
+    if len(data) < HEADER.size:
         return None
-    code, _length, segment, sec_id = struct.unpack_from("<BHBI", data, 0)
-    body = data[8:]
+    code, _length, segment, sec_id = HEADER.unpack_from(data, 0)
     sid = str(sec_id)
-    if code == CODE_TICKER and len(body) >= 8:
-        ltp, ltt = struct.unpack_from("<fI", body, 0)
+    required = PACKET_SIZES.get(code)
+    if required is not None and len(data) < required:
+        log.warning("feed_packet_truncated %s", kv(code=code, security_id=sid, length=len(data), required=required))
+        return None
+    if code == CODE_TICKER:
+        ltp, ltt = TICKER.unpack_from(data, 8)
         return FeedPacket(code, sid, segment, ltp=ltp, ltt=ltt)
-    if code in (CODE_QUOTE, CODE_FULL) and len(body) >= 42:
-        ltp, ltq, ltt, _atp, volume, _tsq, _tbq, _o, _c, _h, _l = struct.unpack_from("<fhIfIIIffff", body, 0)
-        oi = None
-        if code == CODE_FULL and len(body) >= 46:
-            (oi,) = struct.unpack_from("<I", body, 42)
-        return FeedPacket(code, sid, segment, ltp=ltp, ltt=ltt, last_qty=float(ltq), volume=float(volume), open_interest=float(oi) if oi else None)
-    if code == CODE_OI and len(body) >= 4:
-        (oi,) = struct.unpack_from("<I", body, 0)
+    if code == CODE_QUOTE:
+        ltp, ltq, ltt, atp, volume, tsq, tbq, o, c, h, l = QUOTE.unpack_from(data, 8)
+        return FeedPacket(code, sid, segment, ltp=ltp, ltt=ltt, last_qty=float(ltq), atp=atp, volume=float(volume), total_sell_qty=tsq,
+                          total_buy_qty=tbq, day_open=o, day_close=c, day_high=h, day_low=l)
+    if code == CODE_FULL:
+        ltp, ltq, ltt, atp, volume, tsq, tbq, oi, oi_hi, oi_lo, o, c, h, l = FULL_HEAD.unpack_from(data, 8)
+        depth = tuple(DepthLevel(*DEPTH_LEVEL.unpack_from(data, 8 + FULL_HEAD.size + i * DEPTH_LEVEL.size)) for i in range(5))
+        return FeedPacket(code, sid, segment, ltp=ltp, ltt=ltt, last_qty=float(ltq), atp=atp, volume=float(volume), total_sell_qty=tsq,
+                          total_buy_qty=tbq, day_open=o, day_close=c, day_high=h, day_low=l, open_interest=float(oi) if oi else None,
+                          oi_day_high=float(oi_hi), oi_day_low=float(oi_lo), depth=depth)
+    if code == CODE_OI:
+        (oi,) = OI.unpack_from(data, 8)
         return FeedPacket(code, sid, segment, open_interest=float(oi))
-    if code == CODE_PREV_CLOSE and len(body) >= 8:
-        return FeedPacket(code, sid, segment)
-    if code == CODE_DISCONNECT and len(body) >= 2:
-        (reason,) = struct.unpack_from("<h", body, 0)
+    if code == CODE_PREV_CLOSE:
+        prev_close, prev_oi = PREV_CLOSE.unpack_from(data, 8)
+        return FeedPacket(code, sid, segment, prev_close=prev_close, prev_open_interest=float(prev_oi))
+    if code == CODE_DISCONNECT:
+        (reason,) = DISCONNECT.unpack_from(data, 8)
         return FeedPacket(code, sid, segment, disconnect_reason=reason)
+    if code == CODE_MARKET_STATUS:
+        return FeedPacket(code, sid, segment)
+    log.debug("feed_packet_unknown %s", kv(code=code, security_id=sid, length=len(data)))
     return FeedPacket(code, sid, segment)
 
 

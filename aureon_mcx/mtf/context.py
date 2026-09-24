@@ -48,12 +48,21 @@ class TimeframeRead:
                 "open_time": self.open_time.isoformat() if self.open_time else None}
 
 
+def ema_relation(ind: IndicatorRow) -> str:
+    """Human label using the CONFIGURED periods (never hard-coded EMA20/EMA50)."""
+    fast, slow = f"EMA{ind.ema_fast_period}", f"EMA{ind.ema_slow_period}"
+    if ind.ema_fast is None or ind.ema_slow is None:
+        return f"{fast}/{slow} n/a"
+    op = ">" if ind.ema_fast > ind.ema_slow else ("<" if ind.ema_fast < ind.ema_slow else "=")
+    return f"{fast} {op} {slow}"
+
+
 def classify_timeframe(timeframe: Timeframe, ind: IndicatorRow | None, structure: StructureContext | None,
                        rsi_threshold: float = 50.0, require_structure: bool = True) -> TimeframeRead:
     """EMA relation + RSI side + structure regime -> BULLISH / BEARISH / SIDEWAYS. Fails closed to SIDEWAYS/unavailable."""
     if ind is None or not ind.warmed:
         return TimeframeRead(timeframe, TrendDirection.UNAVAILABLE, evidence={"reason": "indicators not warmed"})
-    ema_rel = "EMA20 > EMA50" if ind.ema_fast > ind.ema_slow else ("EMA20 < EMA50" if ind.ema_fast < ind.ema_slow else "EMA20 = EMA50")
+    ema_rel = ema_relation(ind)
     ema_dir = Direction.BULLISH if ind.ema_fast > ind.ema_slow else (Direction.BEARISH if ind.ema_fast < ind.ema_slow else Direction.NEUTRAL)
     rsi_dir = Direction.BULLISH if ind.rsi >= rsi_threshold else Direction.BEARISH
     if ind.rsi == rsi_threshold:
