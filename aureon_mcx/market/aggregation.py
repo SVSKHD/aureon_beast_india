@@ -102,6 +102,13 @@ class TimeframeAggregator:
             return closed
         return emitted
 
+    def mark_emitted_until(self, open_time: datetime) -> None:
+        """Treat every bucket up to and including `open_time` as already emitted (used when
+        seeding from storage so a stored broker bar is never re-emitted)."""
+        ts = self._bucket_start(ensure_utc(open_time))
+        if self._last_emitted_open is None or ts > self._last_emitted_open:
+            self._last_emitted_open = ts
+
     def flush_at(self, now: datetime) -> Candle | None:
         """Emit the open bucket if wall-clock `now` is past its boundary."""
         if self._bucket is not None and ensure_utc(now) >= self._bucket.end_time:
