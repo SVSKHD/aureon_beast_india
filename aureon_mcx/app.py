@@ -1033,6 +1033,8 @@ class Application:
             return
         except asyncio.TimeoutError:
             pass
+        if self.stop.is_set():
+            return  # shutdown began while the backoff elapsed: never spawn a task that is about to be cancelled
         if name == "discord" and self.discord_client is not None and self.discord_client.is_closed():
             self.health.set("discord", "restarting")
         self._start(name)

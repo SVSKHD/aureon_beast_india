@@ -666,7 +666,9 @@ def test_supervisor_restarts_tasks_that_return_normally_while_running(tmp_path, 
             await super().run(stop)
 
     def feed_factory(cfg, on_tick, health):
-        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",))
+        # the run only ends once every silently-returned task has actually been restarted, so the
+        # assertions below do not depend on how quickly the loop schedules the restarts
+        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",), settle=lambda: quiet.starts >= 2 and attempts["flush"] >= 2)
         feeds.append(f)
         return f
 
