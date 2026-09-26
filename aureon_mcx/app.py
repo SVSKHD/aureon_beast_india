@@ -202,7 +202,7 @@ class Application:
             # DECISION: PostgreSQL backend is selectable in config but not implemented; fail closed.
             raise StartupError(f"storage backend {cfg.env.AUREON_STORAGE_BACKEND!r} is not implemented in this build")
         self.db = Database(cfg.env.AUREON_LOCAL_DB_PATH)
-        version = self.db.migrate()
+        version = self.db.migrate({"calendar": self.calendar, "now": self._now()})
         self.repos = Repositories(self.db)
         for c in contracts.values():
             self.repos.instruments.upsert_active(c.as_row())
