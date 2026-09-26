@@ -45,6 +45,12 @@ class EnvSettings(BaseSettings):
     AUREON_PARQUET_DIR: str = "data/parquet"
     AUREON_LOG_LEVEL: str = "INFO"
 
+    # Read-only status API (port 1250 by default); no execution endpoints exist.
+    AUREON_API_ENABLED: bool = True
+    AUREON_API_HOST: str = "0.0.0.0"
+    AUREON_API_PORT: int = Field(default=1250, ge=1, le=65535)
+    AUREON_GIT_SHA: str | None = None
+
     DISCORD_TOKEN: SecretStr | None = None
     DISCORD_CHANNEL_ID: int | None = None
     DISCORD_GUILD_ID: int | None = None

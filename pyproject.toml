@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aureon-mcx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Aureon MCX: research-first DhanHQ market-structure observer for MCX GOLD / SILVER futures"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,8 @@ dependencies = [
   "httpx>=0.27",
   "websockets>=12",
   "discord.py>=2.3",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]

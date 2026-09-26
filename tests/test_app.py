@@ -65,10 +65,11 @@ class FakeHttp:
 
 
 class FakeHistorical:
-    def __init__(self, clock, fail_for: set[str] | None = None):
+    def __init__(self, clock, fail_for: set[str] | None = None, anchor: datetime = NOW):
         self.calls = []
         self.clock = clock
         self.fail_for = fail_for or set()
+        self.anchor = anchor  # warmup history ends here (the process start time in the scenario)
 
     def fetch(self, symbol, security_id, seg, itype, expiry, timeframe, start, end):
         self.calls.append((symbol, security_id, timeframe, start, end))
@@ -77,14 +78,14 @@ class FakeHistorical:
         now = self.clock[0]
         if timeframe is Timeframe.M1:
             return [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
-        if start >= NOW:  # live-period broker bars derive from the same fake market as the ticks
+        if start >= self.anchor:  # live-period broker bars derive from the same fake market as the ticks
             m1 = [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
             return aggregate_closed(m1, timeframe) if m1 else []
-        # per-timeframe broker series ending at NOW (like the real warmup: exact broker candles per interval)
+        # per-timeframe broker series ending at the anchor (like the real warmup: exact broker candles per interval)
         n = {Timeframe.M5: 240, Timeframe.M15: 300, Timeframe.H1: 200}[timeframe]
         from aureon_mcx.market.timeutil import floor_to
 
-        first = floor_to(NOW - timedelta(seconds=timeframe.seconds * n), timeframe.seconds)  # IST-aligned like Dhan's bars
+        first = floor_to(self.anchor - timedelta(seconds=timeframe.seconds * n), timeframe.seconds)  # IST-aligned like Dhan's bars
         return make_candles(n, start=first, tf=timeframe, symbol=symbol, security_id=security_id, expiry=expiry,
                             prices=trending_prices(n), base=SECURITY_PRICES.get(security_id, 70000.0))
 
@@ -206,13 +207,14 @@ def _config_dir(tmp_path, analysis_updates: dict | None = None):
 
 
 def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwargs=None, fail_for=None, historical=None,
-         analysis_updates=None, feed_stall_seconds=3600.0, flush_interval=0.05):
+         analysis_updates=None, feed_stall_seconds=3600.0, flush_interval=0.05, scanner_packets=None):
     """Build an Application over fakes. The fake feed's clock jumps ~15 s between ticks, so the
     socket-stall watchdog is disabled by default (tests that exercise it set a threshold)."""
     monkeypatch.setenv("DHAN_CLIENT_ID", "cid-1")
     monkeypatch.setenv("DHAN_ACCESS_TOKEN", "tok-secret-1")
     monkeypatch.setenv("AUREON_LOCAL_DB_PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("SYMBOLS", symbols)
+    monkeypatch.setenv("AUREON_API_ENABLED", "false")  # the API server is exercised by tests/test_api.py
     monkeypatch.chdir(tmp_path)
     from aureon_mcx.broker.dhan.instruments import DhanInstrumentProvider
 

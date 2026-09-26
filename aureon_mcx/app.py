@@ -396,6 +396,7 @@ class Application:
     def _on_tick(self, tick: Tick) -> None:
         now = self._now()
         self._last_packet_at = now
+        self._tick_times.append(now)
         self.metrics.inc("ticks_received")
         self.agents.heartbeat("market_feed_agent", work=1)
         rt = self._runtime_for_security(tick.security_id)
@@ -1054,6 +1055,7 @@ class Application:
             self._stale_check()
             self._calendar_check()
             self._market_watch(self._now())
+            self._refresh_db_stats()
             self.agents.heartbeat("health_agent")
             self.agents.check_heartbeats()
             line = self.health.status_line()
