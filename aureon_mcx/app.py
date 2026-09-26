@@ -23,6 +23,7 @@ import asyncio
 import logging
 import signal
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -48,6 +49,7 @@ from aureon_mcx.market.timeutil import IST, utc_now
 from aureon_mcx.market.warmup import derive_h4, seed_pipeline, warmup_window
 from aureon_mcx.observer import NullSink, PresentationSink, SymbolObserver
 from aureon_mcx.outcomes import OutcomeService
+from aureon_mcx.scanner import InstrumentScanner
 from aureon_mcx.storage import Database, Repositories
 from aureon_mcx.storage.parquet_archive import ParquetArchive
 from aureon_mcx.version import short_sha, version_info
@@ -91,7 +93,8 @@ class Application:
                  instrument_provider_factory: Callable[..., Any] | None = None, historical_factory: Callable[..., Any] | None = None,
                  feed_factory: Callable[..., Any] | None = None, sink_factory: Callable[..., Any] | None = None,
                  now: Callable[[], datetime] = utc_now, validate_credentials_remotely: bool = True,
-                 housekeeping_interval: float = 30.0, flush_interval: float = 1.0, feed_stall_seconds: float | None = None):
+                 housekeeping_interval: float = 30.0, flush_interval: float = 1.0, feed_stall_seconds: float | None = None,
+                 scanner_feed_factory: Callable[..., Any] | None = None, scanner_interval: float = 5.0):
         self._config_dir = config_dir
         self._env_file = env_file
         self._http_factory = http_factory or (lambda cfg: DhanHttpClient(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value()))
@@ -100,6 +103,7 @@ class Application:
         self._historical_factory = historical_factory or (lambda cfg, http: DhanHistoricalProvider(
             http, cfg.analysis.historical.max_days_per_request, calendar=self.calendar))
         self._feed_factory = feed_factory
+        self._scanner_feed_factory = scanner_feed_factory  # tests inject fake scanner feeds
         self._sink_factory = sink_factory
         self._now = now
         self._validate_remote = validate_credentials_remotely
@@ -120,6 +124,9 @@ class Application:
         self.historical = None
         self.continuity: ContinuityService | None = None
         self.feed = None
+        self.scanner: InstrumentScanner | None = None
+        self.scanner_feeds: list = []
+        self.scanner_interval = scanner_interval
         self.discord_client = None
         self.stop: asyncio.Event | None = None
         self.startup_log: list[str] = []
@@ -249,6 +256,12 @@ class Application:
         self.resolver = SymbolResolver(cfg.symbols, provider, today=lambda: self._now().astimezone(IST).date())
         master = self.resolver.refresh(force=False)
         self._step(3, f"instrument master records={len(master.records)} version={master.version}")
+        if cfg.scanner.enabled:
+            self.scanner = InstrumentScanner(cfg.scanner, now=self._now, events=self.events, metrics=self.metrics,
+                                             is_market_open=lambda ts: self.calendar.is_open(ts))
+            n = self.scanner.build(master, self._now().astimezone(IST).date())
+            log.info("scanner_universe_built %s", kv(instruments=n, partitions=len(self.scanner.partitions),
+                                                     segments=",".join(f"{k}={len(v)}" for k, v in self.scanner.universe.items())))
         # 4/5 resolve
         contracts: dict[str, ResolvedContract] = {}
         for i, sym in enumerate(cfg.logical_symbols, start=4):
@@ -270,6 +283,8 @@ class Application:
         version = self.db.migrate({"calendar": self.calendar, "now": self._now()})
         self.repos = Repositories(self.db)
         self.crashes.repos = self.repos
+        if self.scanner is not None:
+            self.scanner.repos = self.repos
         self.events.subscribe(self._persist_event)
         self.agents.start("storage_agent", path=cfg.env.AUREON_LOCAL_DB_PATH, schema_version=version)
         if version != before:
@@ -1148,11 +1163,12 @@ class Application:
         for a in self.agents.agents.values():
             if a.state not in ("FAILED", "STOPPED"):
                 a.state = "STOPPED"
-        if self.feed is not None and hasattr(self.feed, "disconnect"):
-            try:
-                await self.feed.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+        for f in [self.feed] + list(self.scanner_feeds):
+            if f is not None and hasattr(f, "disconnect"):
+                try:
+                    await f.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
         if self.discord_client is not None:
             try:
                 await self.discord_client.close()

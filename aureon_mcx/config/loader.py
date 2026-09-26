@@ -12,7 +12,8 @@ from pydantic import ValidationError
 from aureon_mcx.market.timeframe import Timeframe
 
 from .env import EnvSettings
-from .yaml_models import AnalysisConfig, ConfirmationPolicyConfig, ExchangeCalendarConfig, SessionOverridesConfig, SessionsConfig, SymbolsConfig
+from .yaml_models import (AnalysisConfig, ConfirmationPolicyConfig, ExchangeCalendarConfig, ScannerConfig, SessionOverridesConfig, SessionsConfig,
+                          SymbolsConfig)
 
 
 class ConfigError(RuntimeError):
@@ -27,6 +28,7 @@ class AppConfig:
     policy: ConfirmationPolicyConfig
     analysis: AnalysisConfig
     config_dir: Path
+    scanner: ScannerConfig = ScannerConfig()
 
     @property
     def logical_symbols(self) -> list[str]:
@@ -105,12 +107,15 @@ def load_config(config_dir: str | os.PathLike | None = None, env_file: str | os.
         sessions = sessions.model_copy(update={"overrides": overrides})
     # The exchange calendar is mandatory: without it holidays and the seasonal 23:30 close would
     # be treated as open market and missing candles would look like gaps (or worse, be trusted).
-    calendar_path = cdir / "exchange_calendar.yaml"
-    calendar = _validate(ExchangeCalendarConfig, _read_yaml(calendar_path), calendar_path)
-    sessions = sessions.model_copy(update={"calendar": calendar})
+    calendars = load_calendars(cdir)
+    latest = calendars[max(calendars)]
+    sessions = sessions.model_copy(update={"calendar": latest, "calendars": calendars})
     policy = _validate(ConfirmationPolicyConfig, _read_yaml(cdir / "confirmation_policy.yaml"), cdir / "confirmation_policy.yaml")
     analysis_path = cdir / "analysis.yaml"
     analysis = _validate(AnalysisConfig, _read_yaml(analysis_path) if analysis_path.exists() else {}, analysis_path)
+    scanner_path = cdir / "scanner.yaml"
+    scanner = _validate(ScannerConfig, (_read_yaml(scanner_path) if scanner_path.exists() else {}).get("scanner", {}) or {}, scanner_path) \
+        if scanner_path.exists() else ScannerConfig()
 
     # Cross-file checks (fail closed).
     for sym in env.symbols:
@@ -126,4 +131,4 @@ def load_config(config_dir: str | os.PathLike | None = None, env_file: str | os.
             raise ConfigError(f"timeframe {tf.value} is neither downloadable nor aggregatable")
     if env.primary_timeframe not in analysis.historical.warmup_bars:
         raise ConfigError(f"analysis.historical.warmup_bars has no entry for primary timeframe {env.primary_timeframe.value}")
-    return AppConfig(env=env, symbols=symbols, sessions=sessions, policy=policy, analysis=analysis, config_dir=cdir)
+    return AppConfig(env=env, symbols=symbols, sessions=sessions, policy=policy, analysis=analysis, config_dir=cdir, scanner=scanner)

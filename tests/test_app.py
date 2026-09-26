@@ -157,6 +157,37 @@ class FakeFeed:
         self.disconnected = True
 
 
+class FakeScannerFeed:
+    """Scanner feed partition: delivers scripted FeedPackets (default none) and waits for stop."""
+
+    def __init__(self, on_packet, index=0, packets=None):
+        self.on_packet = on_packet
+        self.index = index
+        self.packets = list(packets or [])
+        self.subscribed: list[str] = []
+        self.connected = False
+        self.disconnected = False
+        self.on_status = lambda s, d: None
+
+    async def subscribe(self, ids):
+        self.subscribed += list(ids)
+
+    async def unsubscribe(self, ids):
+        self.subscribed = [s for s in self.subscribed if s not in ids]
+
+    async def run(self, stop):
+        self.connected = True
+        self.on_status("connected", {"reconnects": 0})
+        for p in self.packets:
+            self.on_packet(p)
+            await asyncio.sleep(0)
+        await stop.wait()
+        self.connected = False
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
 def _config_dir(tmp_path, analysis_updates: dict | None = None):
     """Copy the repo config into tmp_path and patch analysis.yaml sections (nested dict merge)."""
     import shutil
@@ -205,11 +236,20 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
         feeds.append(f)
         return f
 
+    scanner_feeds = []
+
+    def scanner_feed_factory(cfg, on_packet, index):
+        f = FakeScannerFeed(on_packet, index, scanner_packets if index == 0 else None)
+        scanner_feeds.append(f)
+        return f
+
     app = Application(config_dir=str(config_dir), env_file=str(tmp_path / "none.env"), http_factory=lambda cfg: fake_http,
                       instrument_provider_factory=lambda cfg, http: DhanInstrumentProvider("u", tmp_path / "m.csv", 24, http, now=lambda: NOW),
                       historical_factory=lambda cfg, http: hist, feed_factory=feed_factory,
                       sink_factory=lambda cfg, repos: (NullSink(), None), now=lambda: clock[0], housekeeping_interval=0.2,
-                      flush_interval=flush_interval, feed_stall_seconds=feed_stall_seconds)
+                      flush_interval=flush_interval, feed_stall_seconds=feed_stall_seconds, scanner_feed_factory=scanner_feed_factory,
+                      scanner_interval=0.1)
+    app.test_scanner_feeds = scanner_feeds
     holder["app"] = app
     return app, fake_http, hist, feeds, clock
 
@@ -730,3 +770,28 @@ def test_live_run_fails_closed_when_calendar_year_ends(tmp_path, monkeypatch):
     assert len(failures) == 1 and "MCX calendar for 2027 not installed" in failures[0].message
     assert app.pipelines["428291"].gaps == [] or all(g.open_time < datetime(2027, 1, 1, tzinfo=timezone.utc) for g in app.pipelines["428291"].gaps)
     assert app.task_failures == []
+
+
+def test_scanner_runs_beside_the_observer(tmp_path, monkeypatch):
+    from tests.test_scanner import prev_close_packet, quote_packet
+
+    packets = [prev_close_packet(428291, 70000.0), quote_packet(428291, 70700.0), prev_close_packet(429004, 84000.0),
+               quote_packet(429004, 83160.0), quote_packet(428294, 5900.0)]
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 3, "ids": ("428291",)},
+                                         scanner_packets=packets)
+    app.startup()
+    assert app.scanner is not None and app.scanner.universe_size == 8  # front-month MCX futures from the fixture master
+    asyncio.run(app.run())
+    sf = app.test_scanner_feeds
+    assert len(sf) == 1 and sorted(sf[0].subscribed) == sorted(app.scanner.security_ids()) and sf[0].disconnected
+    board = app.scanner.leaderboard(clock[0])
+    assert board["universe"] == 8
+    winners = [(w["symbol"], round(w["change_pct"], 2)) for w in board["winners"]]
+    losers = [(l["symbol"], round(l["change_pct"], 2)) for l in board["losers"]]
+    assert winners == [("GOLD", 1.0), ("SILVERM", -1.0)] and losers == [("SILVERM", -1.0), ("GOLD", 1.0)]
+    assert app.scanner.quotes["428294"].change_pct is None  # no verified previous close: never a fabricated %
+    b = board["breadth"]["overall"]
+    assert (b["advancing"], b["declining"], b["unavailable"]) == (1, 1, 6)
+    assert app.agents.get("scanner_agent").work_count >= 1 and app.agents.get("scanner_agent").details["universe"] == 8
+    assert app.health.symbols["GOLD"].state == "LIVE"  # tier-2 observation is unaffected
+    assert app.metrics.get("scanner_updates") >= 1 and app.scanner.repos is not None  # periodic snapshots are wired (cadence tested in test_scanner)

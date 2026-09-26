@@ -540,3 +540,40 @@ class AnalysisConfig(StrictModel):
     historical: HistoricalSpec = HistoricalSpec()
     discord: DiscordSpec = DiscordSpec()
     execution: ExecutionSpec = ExecutionSpec()
+
+
+# ---------------------------------------------------------------- scanner.yaml
+class ScannerConfig(StrictModel):
+    """Broad-market scanner (tier 1): every enabled instrument gets LTP / previous close /
+    % change / breadth; only the configured logical symbols get the deep observer (tier 2)."""
+
+    enabled: bool = True
+    segments: list[str] = Field(default_factory=lambda: ["MCX_COMM"])
+    instrument_types: list[str] = Field(default_factory=lambda: ["FUTCOM"])
+    include: list[str] = Field(default_factory=lambda: ["*"])   # base-name globs
+    exclude: list[str] = Field(default_factory=list)
+    # one contract per base name (nearest non-expired expiry): the liquid front month
+    nearest_expiry_only: bool = True
+    # Dhan v2 live feed: up to 100 instruments per subscription request and (documented) up to
+    # 5000 instruments per WebSocket connection; the deep observer uses one more connection.
+    max_subscriptions_per_connection: int = Field(default=5000, ge=1, le=5000)
+    max_connections: int = Field(default=2, ge=1, le=4)
+    feed_mode: Literal["ticker", "quote", "full"] = "quote"
+    winners_limit: int = Field(default=20, ge=1, le=100)
+    losers_limit: int = Field(default=20, ge=1, le=100)
+    stale_after_seconds: float = Field(default=300.0, gt=0)
+    snapshot_interval_seconds: float = Field(default=900.0, ge=0)   # 0 disables market_rank_snapshots
+    digest_interval_seconds: float = Field(default=900.0, ge=60)
+    # The verified previous close comes from Dhan's explicit "previous close" packet. Only enable
+    # this after confirming on a live run that the quote packet's day-close field carries the
+    # previous session close for the segment; otherwise the reference stays MISSING (no fake %).
+    previous_close_from_quote_day_close: bool = False
+    category_map: dict[str, str] = Field(default_factory=dict)   # base name -> logical category (bullion, energy, ...)
+
+    @field_validator("segments", "instrument_types")
+    @classmethod
+    def _upper(cls, v: list[str]) -> list[str]:
+        out = [x.strip().upper() for x in v if x.strip()]
+        if not out:
+            raise ValueError("must not be empty")
+        return out
