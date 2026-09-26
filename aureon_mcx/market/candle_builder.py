@@ -24,8 +24,11 @@ Continuity rules
 from __future__ import annotations
 
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from .aggregation import AggregationResult, Completeness, TimeframeAggregator
@@ -40,6 +43,78 @@ log = logging.getLogger("aureon.candles")
 
 REASON_PARTIAL = "partial_coverage"
 REASON_SILENT = "silent_feed"
+REASON_SUSPECT = "feed_stall"          # continuity lost inside the minute (delivery froze / socket dropped)
+REASON_BROKER_MISSING = "broker_missing"
+REASON_RECONCILE = "reconcile_mismatch"
+
+
+class M1TrustState(str, Enum):
+    """Life of one live M1 minute.
+
+    OPEN_TRUSTED    open, coverage from its start, feed healthy so far
+    OPEN_SUSPECT    open, continuity was lost inside the minute (stall / disconnect / reconnect)
+    TRUSTED         closed, fully covered: admitted to aggregation as a live bar
+    PARTIAL         closed but only partly observed: never enters aggregation
+    AWAITING_BROKER queued for exact broker M1 verification (partial / silent / suspect)
+    VERIFIED        the broker's M1 replaced (or, in reconcile mode, confirmed) the local one
+    REJECTED        reconcile mode found the local bar differed from the broker's
+    """
+
+    OPEN_TRUSTED = "OPEN_TRUSTED"
+    OPEN_SUSPECT = "OPEN_SUSPECT"
+    TRUSTED = "TRUSTED"
+    PARTIAL = "PARTIAL"
+    AWAITING_BROKER = "AWAITING_BROKER"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class MinuteTrust:
+    """Everything known about the feed's behaviour during one minute (audit + decisions)."""
+
+    minute: datetime
+    state: M1TrustState
+    first_packet_at: datetime | None = None
+    last_packet_at: datetime | None = None
+    packets: int = 0
+    socket_connected_at_open: bool = False
+    feed_generation: int = 0
+    stale_transitions: list[datetime] = field(default_factory=list)
+    continuity_lost: bool = False
+    reason: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"minute": self.minute.isoformat(), "state": self.state.value,
+                "first_packet_at": self.first_packet_at.isoformat() if self.first_packet_at else None,
+                "last_packet_at": self.last_packet_at.isoformat() if self.last_packet_at else None, "packets": self.packets,
+                "socket_connected_at_open": self.socket_connected_at_open, "feed_generation": self.feed_generation,
+                "stale_transitions": [t.isoformat() for t in self.stale_transitions], "continuity_lost": self.continuity_lost,
+                "reason": self.reason}
+
+
+class ThreadAffinityError(RuntimeError):
+    """Pipeline / health state was mutated from a thread other than the event loop's."""
+
+
+class LoopBound:
+    """Mixin: once bound, mutations from any other thread raise ThreadAffinityError.
+
+    Worker threads may fetch data (blocking HTTP) but must return immutable results; every
+    pipeline / health / observer mutation happens on the asyncio event-loop thread."""
+
+    _owner_thread: int | None = None
+
+    def bind_to_current_thread(self) -> None:
+        self._owner_thread = threading.get_ident()
+
+    def unbind_thread(self) -> None:
+        self._owner_thread = None
+
+    def _check_thread(self, what: str = "mutation") -> None:
+        owner = self._owner_thread
+        if owner is not None and owner != threading.get_ident():
+            raise ThreadAffinityError(f"{type(self).__name__}.{what} called from thread {threading.get_ident()} (owner {owner})")
 
 
 @dataclass(frozen=True)
@@ -92,21 +167,72 @@ class M1CandleBuilder:
         self._bucket_trusted = False
         self.coverage_start: datetime | None = None  # instant from which live coverage is trustworthy
         self.last_tick_at: datetime | None = None
+        # feed continuity: a stall (delivery frozen while the socket looks connected) or a
+        # disconnect inside a minute makes that minute SUSPECT; coverage resumes at the next packet
+        self.feed_generation = 0
+        self.socket_connected = False
+        self.stale = False
+        self.stale_since: datetime | None = None
+        self.trust: dict[datetime, MinuteTrust] = {}
+        self._trust_order: deque[datetime] = deque()
+
+    # -- trust records -----------------------------------------------------
+    def _record(self, minute: datetime) -> MinuteTrust:
+        rec = self.trust.get(minute)
+        if rec is None:
+            rec = MinuteTrust(minute=minute, state=M1TrustState.OPEN_TRUSTED, socket_connected_at_open=self.socket_connected,
+                              feed_generation=self.feed_generation)
+            self.trust[minute] = rec
+            self._trust_order.append(minute)
+            while len(self._trust_order) > 720:
+                self.trust.pop(self._trust_order.popleft(), None)
+        return rec
+
+    def minute_trust(self, minute: datetime) -> MinuteTrust | None:
+        return self.trust.get(floor_to(ensure_utc(minute), 60, self.tz))
+
+    def _lose_open_bucket(self, ts: datetime | None, reason: str) -> None:
+        """The minute in progress can no longer be trusted from ticks."""
+        if self._open_time is None:
+            return
+        self._bucket_trusted = False
+        rec = self._record(self._open_time)
+        rec.state = M1TrustState.OPEN_SUSPECT
+        rec.continuity_lost = True
+        rec.reason = rec.reason or reason
+        if ts is not None:
+            rec.stale_transitions.append(ensure_utc(ts))
 
     # -- coverage state ---------------------------------------------------
     def set_connected(self, ts: datetime) -> None:
-        """Trustworthy coverage begins now. The minute containing `ts` is partial unless
-        `ts` is exactly its open."""
+        """Trustworthy coverage begins now (connect / reconnect / rollover / stall recovery).
+        The minute containing `ts` is partial unless `ts` is exactly its open."""
         self.coverage_start = ensure_utc(ts)
+        self.feed_generation += 1
+        self.socket_connected = True
+        self.stale = False
+        self.stale_since = None
         if self._open_time is not None and self._open_time < self.coverage_start:
-            self._bucket_trusted = False
+            self._lose_open_bucket(ts, REASON_PARTIAL)
 
     def set_disconnected(self) -> None:
         self.coverage_start = None
-        self._bucket_trusted = False  # whatever is open lost its coverage
+        self.socket_connected = False
+        self._lose_open_bucket(None, REASON_SUSPECT)  # whatever is open lost its coverage
+
+    def set_stale(self, ts: datetime) -> bool:
+        """Feed delivery is suspected frozen (no packet for too long on a connected socket).
+        The open minute becomes SUSPECT; later minutes are silent until a packet resumes
+        coverage (see `add_tick`). Returns True when this call changed the state."""
+        if self.stale:
+            return False
+        self.stale = True
+        self.stale_since = ensure_utc(ts)
+        self._lose_open_bucket(ts, REASON_SUSPECT)
+        return True
 
     def minute_trusted(self, minute: datetime) -> bool:
-        return self.coverage_start is not None and self.coverage_start <= ensure_utc(minute)
+        return self.coverage_start is not None and not self.stale and self.coverage_start <= ensure_utc(minute)
 
     @property
     def open_minute(self) -> datetime | None:
@@ -128,6 +254,10 @@ class M1CandleBuilder:
         c = Candle(symbol=self.symbol, security_id=self.security_id, timeframe=Timeframe.M1, open_time=self._open_time,
                    open=self._o, high=self._h, low=self._l, close=self._c, volume=self._vol, open_interest=self._oi,
                    source="dhan" if self._bucket_trusted else "partial", is_closed=True, expiry_date=self.expiry_date)
+        rec = self._record(self._open_time)
+        rec.state = M1TrustState.TRUSTED if self._bucket_trusted else M1TrustState.PARTIAL
+        if not self._bucket_trusted and rec.reason is None:
+            rec.reason = REASON_PARTIAL
         self._last_emitted = self._open_time
         self._last_close = self._c
         self._open_time = None
@@ -136,6 +266,9 @@ class M1CandleBuilder:
     def add_tick(self, tick: Tick) -> list[BuiltM1]:
         ts = ensure_utc(tick.ts)
         self.last_tick_at = ts
+        if self.stale:
+            # delivery resumed: coverage is trustworthy again only from this packet onward
+            self.set_connected(ts)
         start = floor_to(ts, 60, self.tz)
         if self._last_emitted is not None and start <= self._last_emitted:
             return []  # late tick for a closed minute: ignore, never reopen
@@ -148,6 +281,15 @@ class M1CandleBuilder:
             self._o = self._h = self._l = self._c = tick.price
             self._vol = 0.0
             self._oi = None
+            rec = self._record(start)
+            rec.state = M1TrustState.OPEN_TRUSTED if self._bucket_trusted else M1TrustState.OPEN_SUSPECT
+            if not self._bucket_trusted:
+                rec.reason = REASON_PARTIAL
+        rec = self._record(start)
+        rec.packets += 1
+        rec.last_packet_at = ts
+        if rec.first_packet_at is None:
+            rec.first_packet_at = ts
         self._h = max(self._h, tick.price)
         self._l = min(self._l, tick.price)
         self._c = tick.price
@@ -182,7 +324,17 @@ GapHandler = Callable[[GapRecord], None]
 PendingHandler = Callable[[datetime, str], None]
 
 
-class CandlePipeline:
+@dataclass(frozen=True)
+class ReconcileResult:
+    minute: datetime
+    matched: bool
+    local: Candle
+    broker: Candle | None
+    differences: tuple[str, ...] = ()
+    replaced_in_open_bucket: bool = False
+
+
+class CandlePipeline(LoopBound):
     """Per-symbol pipeline: ticks -> M1 -> primary (M5) -> higher timeframes.
 
     `on_closed(candle)` is invoked once per COMPLETE closed candle for every timeframe
@@ -191,7 +343,8 @@ class CandlePipeline:
 
     def __init__(self, symbol: str, security_id: str, expiry_date: str, primary: Timeframe, timeframes: list[Timeframe],
                  on_closed: ClosedHandler, tz=IST, calendar: "SessionCalendar | None" = None, on_gap: GapHandler | None = None,
-                 clock: Callable[[], datetime] | None = None, on_pending: PendingHandler | None = None):
+                 clock: Callable[[], datetime] | None = None, on_pending: PendingHandler | None = None,
+                 reconcile_live_m1: bool = False, reconcile_volume_tolerance: float = 0.2, metrics=None):
         if primary == Timeframe.M1:
             raise ValueError("primary timeframe must be above M1")
         self.symbol = symbol
@@ -227,9 +380,15 @@ class CandlePipeline:
         self._deferred: list[Candle] = []
         self._tick_buffer: list[Tick] = []
         self._seen_m1: set[datetime] = set()
-        # minutes whose live coverage is not trustworthy (partial / silent): verified against the broker
+        # minutes whose live coverage is not trustworthy (partial / silent / suspect): verified against the broker
         self.pending_verification: dict[datetime, str] = {}
         self.verified_minutes: int = 0
+        # research-validation mode: every trusted live M1 is compared with the broker's M1 shortly after it closes
+        self.reconcile_live_m1 = reconcile_live_m1
+        self.reconcile_volume_tolerance = reconcile_volume_tolerance
+        self.reconcile_queue: dict[datetime, Candle] = {}
+        self.reconcile_results: deque[ReconcileResult] = deque(maxlen=200)
+        self.metrics = metrics if metrics is not None else _Counters()
 
     # ----------------------------------------------------------- properties
     @property
@@ -249,10 +408,28 @@ class CandlePipeline:
 
     # ---------------------------------------------------------- connection
     def set_connected(self, ts: datetime) -> None:
+        self._check_thread("set_connected")
         self.m1.set_connected(ts)
 
     def set_disconnected(self) -> None:
+        self._check_thread("set_disconnected")
         self.m1.set_disconnected()
+
+    def set_stale(self, ts: datetime) -> bool:
+        """Feed delivery suspected frozen: the open minute becomes SUSPECT (never trusted)."""
+        self._check_thread("set_stale")
+        changed = self.m1.set_stale(ts)
+        if changed:
+            log.warning("feed_stall symbol=%s at=%s open_minute=%s", self.symbol, ensure_utc(ts).isoformat(),
+                        self.m1.open_minute.isoformat() if self.m1.open_minute else None)
+        return changed
+
+    @property
+    def feed_stale(self) -> bool:
+        return self.m1.stale
+
+    def minute_trust(self, minute: datetime) -> MinuteTrust | None:
+        return self.m1.minute_trust(minute)
 
     @property
     def coverage_start(self) -> datetime | None:
@@ -283,6 +460,7 @@ class CandlePipeline:
             gap = GapRecord(res.timeframe, res.open_time, res.expected, res.present, res.missing, self._clock())
             self.gaps.append(gap)
             self.suspended = True
+            self.metrics.inc("gaps_detected")
             log.error("market_data_gap symbol=%s tf=%s open_time=%s expected=%d present=%d", self.symbol, res.timeframe.value,
                       res.open_time.isoformat(), res.expected, res.present)
             self.on_gap(gap)
@@ -329,16 +507,25 @@ class CandlePipeline:
         if minute in self._seen_m1 or minute in self.pending_verification:
             return
         self.pending_verification[minute] = reason
+        rec = self.m1._record(minute)
+        rec.state = M1TrustState.AWAITING_BROKER
+        rec.reason = rec.reason or reason
         log.warning("m1_needs_verification symbol=%s minute=%s reason=%s", self.symbol, minute.isoformat(), reason)
         self.on_pending(minute, reason)
 
     def _on_built(self, built: BuiltM1) -> None:
+        rec = self.m1.minute_trust(built.candle.open_time)
         if built.trusted:
+            self.metrics.inc("live_m1_built")
+            if self.reconcile_live_m1:
+                self.reconcile_queue[built.candle.open_time] = built.candle
             self.on_m1_closed(built.candle)
         else:
-            self._mark_pending(built.candle.open_time, REASON_PARTIAL)
+            reason = (rec.reason if rec and rec.reason else REASON_PARTIAL)
+            self._mark_pending(built.candle.open_time, reason)
 
     def add_tick(self, tick: Tick) -> None:
+        self._check_thread("add_tick")
         if self.recovering:
             self._tick_buffer.append(tick)
             return
@@ -370,6 +557,7 @@ class CandlePipeline:
     def flush_at(self, now: datetime) -> None:
         """Wall-clock boundary check: closes bars whose boundary passed with no new tick and
         queues silent minutes for verification."""
+        self._check_thread("flush_at")
         if self.recovering:
             return
         for built in self.m1.flush_at(now):
@@ -393,7 +581,48 @@ class CandlePipeline:
         return self.last_m1_close
 
     def begin_recovery(self) -> None:
+        self._check_thread("begin_recovery")
         self.recovering = True
+
+    def reconcile_m1(self, broker: list[Candle]) -> list[ReconcileResult]:
+        """Reconcile mode: compare queued trusted live M1 bars with the broker's exact bars.
+
+        A mismatch marks the minute REJECTED and counts `live_m1_mismatches`; when the primary
+        bucket that holds the minute is still open the broker bar replaces the local one so the
+        closed bar is built from verified data. A bar already dispatched cannot be rewritten:
+        the mismatch is reported (event / Discord) instead of silently ignored."""
+        self._check_thread("reconcile_m1")
+        by_time = {c.open_time: c for c in broker if c.is_closed and c.timeframe is Timeframe.M1}
+        out: list[ReconcileResult] = []
+        for minute, local in sorted(self.reconcile_queue.items()):
+            b = by_time.get(minute)
+            if b is None:
+                continue  # broker has not published it yet: stays queued
+            self.reconcile_queue.pop(minute, None)
+            diffs = []
+            for name in ("open", "high", "low", "close"):
+                if abs(getattr(local, name) - getattr(b, name)) > 1e-9:
+                    diffs.append(name)
+            base = max(abs(b.volume), 1.0)
+            if abs(local.volume - b.volume) / base > self.reconcile_volume_tolerance:
+                diffs.append("volume")
+            rec = self.m1._record(minute)
+            self.metrics.inc("live_m1_verified")
+            if not diffs:
+                rec.state = M1TrustState.VERIFIED
+                out.append(ReconcileResult(minute, True, local, b))
+                continue
+            rec.state = M1TrustState.REJECTED
+            rec.reason = REASON_RECONCILE
+            self.metrics.inc("live_m1_mismatches")
+            replaced = self.primary_agg.replace_constituent(b)
+            for agg in self.higher.values():
+                if agg.source == Timeframe.M1:
+                    agg.replace_constituent(b)
+            log.error("live_m1_mismatch symbol=%s minute=%s fields=%s replaced_in_open_bucket=%s", self.symbol, minute.isoformat(),
+                      ",".join(diffs), replaced)
+            out.append(ReconcileResult(minute, False, local, b, tuple(diffs), replaced))
+        return out
 
     def verify_m1(self, candles: list[Candle], now: datetime, allow_zero_trade_fill: bool = False,
                   fetched_range: tuple[datetime, datetime] | None = None) -> tuple[list[datetime], list[datetime]]:
@@ -403,6 +632,7 @@ class CandlePipeline:
         broker response verifiably spans that minute (bars exist both before and after it inside
         the fetched range). That rule is documented in config: it treats a missing bar strictly
         inside a returned range as a zero-trade minute. It is OFF by default (fail closed)."""
+        self._check_thread("verify_m1")
         now = ensure_utc(now)
         by_time = {c.open_time: c for c in candles if c.is_closed and c.timeframe is Timeframe.M1}
         verified: list[datetime] = []
@@ -422,17 +652,27 @@ class CandlePipeline:
                     log.warning("m1_zero_trade_fill symbol=%s minute=%s", self.symbol, minute.isoformat())
             if candle is None:
                 continue
-            self.pending_verification.pop(minute, None)
+            reason = self.pending_verification.pop(minute, None)
             self.m1.mark_emitted_until(minute)
             self.m1._last_close = candle.close
+            rec = self.m1._record(minute)
+            rec.state = M1TrustState.VERIFIED
             self.on_m1_closed(candle)
             self.verified_minutes += 1
+            self.metrics.inc("live_m1_verified")
+            if reason == REASON_SILENT:
+                self.metrics.inc("silent_m1_replaced")
+            elif reason == REASON_SUSPECT:
+                self.metrics.inc("suspect_m1_replaced")
+            else:
+                self.metrics.inc("partial_m1_replaced")
             verified.append(minute)
         return verified, self.pending_minutes()
 
     def recover_m1(self, candles: list[Candle]) -> int:
         """Feed historical CLOSED M1 candles (chronological) to fill a data gap. Minutes already
         processed are skipped; the M1 builder is advanced so late ticks for them are ignored."""
+        self._check_thread("recover_m1")
         fed = 0
         for c in sorted(candles, key=lambda c: c.open_time):
             if not c.is_closed or c.timeframe is not Timeframe.M1:
@@ -449,6 +689,7 @@ class CandlePipeline:
         return fed
 
     def end_recovery(self) -> None:
+        self._check_thread("end_recovery")
         self.recovering = False
         buffered, self._tick_buffer = self._tick_buffer, []
         for t in buffered:
@@ -456,10 +697,12 @@ class CandlePipeline:
 
     def repair(self, candle: Candle) -> bool:
         """Repair the oldest unresolved gap with the exact broker candle for that bucket."""
+        self._check_thread("repair")
         gap = next((g for g in self.gaps if not g.resolved), None)
         if gap is None or candle.timeframe is not gap.timeframe or candle.open_time != gap.open_time or not candle.is_closed:
             return False
         gap.resolved_at = self._clock()
+        self.metrics.inc("gaps_repaired")
         log.warning("market_data_gap_repaired symbol=%s tf=%s open_time=%s source=%s", self.symbol, candle.timeframe.value,
                     candle.open_time.isoformat(), candle.source)
         self._dispatch(candle)
@@ -484,3 +727,16 @@ class CandlePipeline:
             for agg in self.higher.values():
                 if agg.source == c.timeframe:
                     agg.add(c)
+
+
+class _Counters:
+    """Minimal counter sink used when no shared Metrics object is supplied."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, int] = {}
+
+    def inc(self, name: str, n: int = 1) -> None:
+        self.values[name] = self.values.get(name, 0) + n
+
+    def get(self, name: str) -> int:
+        return self.values.get(name, 0)

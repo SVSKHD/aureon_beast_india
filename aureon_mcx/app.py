@@ -33,11 +33,13 @@ from aureon_mcx.broker.dhan.errors import DhanCredentialsError
 from aureon_mcx.broker.dhan.historical import CachedHistoricalProvider, DhanHistoricalProvider
 from aureon_mcx.broker.dhan.live_feed import DhanLiveFeedProvider
 from aureon_mcx.config import AppConfig, ConfigError, load_config
-from aureon_mcx.continuity import ContinuityService
+from aureon_mcx.continuity import KIND_GAP, KIND_PENDING_MINUTE, ContinuityService
+from aureon_mcx.events import EventType, Severity, SystemEventBus
 from aureon_mcx.health import HealthState
 from aureon_mcx.logging_setup import configure_logging, kv
 from aureon_mcx.market.candle import Candle
-from aureon_mcx.market.candle_builder import CandlePipeline, GapRecord, Tick
+from aureon_mcx.market.candle_builder import REASON_SILENT, REASON_SUSPECT, CandlePipeline, GapRecord, Tick
+from aureon_mcx.metrics import Metrics
 from aureon_mcx.market.sessions import SessionCalendar
 from aureon_mcx.market.timeframe import Timeframe
 from aureon_mcx.market.timeutil import IST, utc_now
@@ -79,7 +81,7 @@ class Application:
                  instrument_provider_factory: Callable[..., Any] | None = None, historical_factory: Callable[..., Any] | None = None,
                  feed_factory: Callable[..., Any] | None = None, sink_factory: Callable[..., Any] | None = None,
                  now: Callable[[], datetime] = utc_now, validate_credentials_remotely: bool = True,
-                 housekeeping_interval: float = 30.0):
+                 housekeeping_interval: float = 30.0, flush_interval: float = 1.0, feed_stall_seconds: float | None = None):
         self._config_dir = config_dir
         self._env_file = env_file
         self._http_factory = http_factory or (lambda cfg: DhanHttpClient(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value()))
@@ -91,6 +93,8 @@ class Application:
         self._now = now
         self._validate_remote = validate_credentials_remotely
         self.housekeeping_interval = housekeeping_interval
+        self.flush_interval = flush_interval
+        self.feed_stall_seconds = feed_stall_seconds  # None -> analysis.historical.feed_stall_seconds
         self.task_backoff_scale = 1.0  # tests shrink restart backoffs
         self.cfg: AppConfig | None = None
         self.http = None
@@ -113,7 +117,14 @@ class Application:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.task_failures: list[tuple[str, str]] = []
         self._verify_inflight: dict[str, bool] = {}
+        self._inflight: dict[tuple[str, str], bool] = {}  # (symbol, operation) -> running
         self._bg_tasks: set[asyncio.Task] = set()  # strong references: asyncio keeps only weak refs to tasks
+        self.events = SystemEventBus(now=self._now)
+        self.metrics = Metrics()
+        self._last_packet_at: datetime | None = None
+        self._feed_stalled = False
+        self._feed_generation = 0
+        self.health.on_symbol_state = self._on_symbol_state_changed
 
     def _spawn(self, coro, name: str) -> asyncio.Task | None:
         if self._loop is None:
@@ -213,9 +224,13 @@ class Application:
         self._cached = CachedHistoricalProvider(self.historical, self.repos, archive, calendar=self.calendar, now=self._now)
         self.continuity = ContinuityService(self.historical, self.repos, self.calendar, self.health, self._now, cfg.primary_timeframe,
                                             allow_zero_trade_fill=cfg.analysis.historical.allow_verified_zero_trade_fill,
-                                            retries=cfg.analysis.historical.verification_retries)
+                                            retries=cfg.analysis.historical.verification_retries,
+                                            backoff=cfg.analysis.historical.verification_backoff_seconds)
         for sym, c in contracts.items():
-            self.runtimes[sym] = self._prepare_symbol(sym, c, "WARMING")
+            self.health.set_symbol_state(sym, "WARMING", f"preparing {c.security_id}", security_id=c.security_id, expiry=c.expiry_iso)
+            self.runtimes[sym] = self._prepare_symbol(sym, c)
+            self.runtimes[sym].observer.health = self.health
+        self._restore_incidents()
         self._step(8, "historical context loaded")
         self._step(9, "indicators warmed")
         self.health.set("config", "ok")
@@ -244,13 +259,16 @@ class Application:
             raise StartupError(f"insufficient {cfg.primary_timeframe.value} history for {sym} ({c.security_id}): {n} bars")
         return hist
 
-    def _prepare_symbol(self, sym: str, c: ResolvedContract, state: str) -> SymbolRuntime:
-        """Load history, warm a fresh observer and seed a pipeline for a contract. Raises on failure."""
+    def _prepare_symbol(self, sym: str, c: ResolvedContract) -> SymbolRuntime:
+        """Load history, warm a fresh observer and seed a pipeline for a contract. Raises on failure.
+
+        May run in a worker thread (rollover): it only builds NEW, unpublished objects. The
+        observer warms against a scratch HealthState; the caller attaches the shared health
+        and binds the pipeline to the event loop when it registers the runtime."""
         assert self.cfg is not None and self.repos is not None and self.calendar is not None
-        self.health.set_symbol_state(sym, state, f"preparing {c.security_id}", security_id=c.security_id, expiry=c.expiry_iso)
         hist = self._load_history(sym, c)
         outcomes = OutcomeService(self.repos, self.cfg.analysis, self.calendar)
-        obs = SymbolObserver(self.cfg, c, self.repos, self.calendar, outcomes, self.sink, self.health)
+        obs = SymbolObserver(self.cfg, c, self.repos, self.calendar, outcomes, self.sink, HealthState())
         obs.warm(hist)
         rt = SymbolRuntime(contract=c, observer=obs, history=hist)
         rt.pipeline = self._make_pipeline(rt)
@@ -259,12 +277,32 @@ class Application:
     def _make_pipeline(self, rt: SymbolRuntime) -> CandlePipeline:
         assert self.cfg is not None
         sym = rt.contract.logical_symbol
+        h = self.cfg.analysis.historical
         p = CandlePipeline(sym, rt.contract.security_id, rt.contract.expiry_iso, self.cfg.primary_timeframe, self.cfg.mtf_timeframes,
                            lambda candle, o=rt.observer: o.on_closed_candle(candle), calendar=self.calendar,
                            on_gap=lambda gap, s=sym: self._on_gap(s, gap), clock=self._now,
-                           on_pending=lambda minute, reason, s=sym: self._on_pending(s, minute, reason))
+                           on_pending=lambda minute, reason, s=sym: self._on_pending(s, minute, reason),
+                           reconcile_live_m1=h.reconcile_every_live_m1, reconcile_volume_tolerance=h.reconcile_volume_tolerance,
+                           metrics=self.metrics)
         seed_pipeline(p, rt.history)
         return p
+
+    def _restore_incidents(self) -> None:
+        """Unresolved incidents persisted by a previous run are re-queued (restart never forgets them)."""
+        if self.continuity is None:
+            return
+        active = {rt.contract.security_id: sym for sym, rt in self.runtimes.items()}
+        for inc in self.continuity.incidents.load(active):
+            rt = self.runtimes.get(inc.symbol)
+            if rt is None or rt.pipeline is None:
+                continue
+            if inc.kind == KIND_PENDING_MINUTE and self.continuity.minute_relevant(inc.open_time):
+                rt.pipeline.pending_verification.setdefault(inc.open_time, inc.reason)
+            elif inc.kind == KIND_PENDING_MINUTE:
+                self.continuity.incidents.abandon(inc, "trading_day_over_at_restart")
+            else:
+                rt.pipeline.gaps.append(GapRecord(inc.timeframe, inc.open_time, 0, 0, (), inc.first_detected_at))
+                rt.pipeline.suspended = True
 
     def _build_pipelines(self) -> None:
         for rt in self.runtimes.values():
@@ -273,15 +311,36 @@ class Application:
 
     # ------------------------------------------------------------ feed hooks
     def _on_tick(self, tick: Tick) -> None:
+        now = self._now()
+        self._last_packet_at = now
+        self.metrics.inc("ticks_received")
         rt = self._runtime_for_security(tick.security_id)
         if rt is None or rt.pipeline is None:
             return
         self.health.tick_seen(rt.contract.logical_symbol, tick.ts)
+        was_stale = rt.pipeline.feed_stale
         rt.pipeline.add_tick(tick)
+        if was_stale and not rt.pipeline.feed_stale:
+            self._on_feed_resumed(now)
+
+    def _on_symbol_state_changed(self, symbol: str, old: str, new: str, detail: str) -> None:
+        sh = self.health.symbols.get(symbol)
+        sev = Severity.INFO if new in ("LIVE", "WARMING", "ROLLOVER_WARMING") else (Severity.ERROR if new == "ERROR" else Severity.WARNING)
+        message = f"{symbol} {old} -> {new}" + (f": {detail}" if detail else "")
+        if new == "LIVE" and old in ("RECOVERING_GAP", "STALE", "DEGRADED", "ERROR"):
+            message = f"{symbol} recovered: {old} -> LIVE" + (f" ({detail})" if detail else "")
+        self.events.emit(EventType.SYMBOL_STATE_CHANGED, message, severity=sev, dedupe_key=f"symbol:{symbol}:{new}", agent="continuity_agent",
+                         symbol=symbol, security_id=sh.security_id if sh else None, old_state=old, new_state=new)
 
     def _on_feed_status(self, status: str, detail: dict) -> None:
         self.health.set("feed", status, str(detail))
         now = self._now()
+        if status == "connected":
+            self._feed_generation += 1
+            self._feed_stalled = False
+            self._last_packet_at = now
+            self.metrics.inc("websocket_reconnects", int(detail.get("reconnects", 0)) - self.metrics.get("websocket_reconnects")
+                             if int(detail.get("reconnects", 0)) > self.metrics.get("websocket_reconnects") else 0)
         for rt in self.runtimes.values():
             sh = self.health.symbol(rt.contract.logical_symbol)
             sh.reconnects = int(detail.get("reconnects", sh.reconnects)) if status == "connected" else sh.reconnects
@@ -293,60 +352,165 @@ class Application:
                 sh.feed_connected = False
                 if rt.pipeline is not None:
                     rt.pipeline.set_disconnected()
+        gen = self._feed_generation
         if status == "connected":
+            self.events.emit(EventType.FEED_CONNECTED, f"feed connected (generation {gen}, reconnects={detail.get('reconnects', 0)})",
+                             dedupe_key=f"feed:connected:gen:{gen}", agent="market_feed_agent", generation=gen, **_safe(detail))
             self._spawn(self.recover_all(), name="recovery")
+        elif status == "reconnecting":
+            self.events.emit(EventType.FEED_RECONNECTING, f"feed reconnecting (attempt {detail.get('attempt')}, delay {detail.get('delay')}s)",
+                             severity=Severity.WARNING, dedupe_key=f"feed:reconnecting:gen:{gen}", agent="market_feed_agent", generation=gen, **_safe(detail))
+        elif status == "stopped":
+            self.events.emit(EventType.FEED_DISCONNECTED, "feed stopped", severity=Severity.WARNING, dedupe_key=f"feed:stopped:gen:{gen}",
+                             agent="market_feed_agent", generation=gen)
+
+    def _feed_watchdog(self, now: datetime) -> None:
+        """A connected socket that delivers nothing for `feed_stall_seconds` in open market is a
+        STALLED feed: the open minute of every symbol becomes SUSPECT (broker-verified later)."""
+        assert self.cfg is not None and self.calendar is not None
+        if self._feed_stalled or not getattr(self.feed, "connected", False) or not self.calendar.is_open(now):
+            return
+        last = self._last_packet_at
+        threshold = self.feed_stall_seconds if self.feed_stall_seconds is not None else self.cfg.analysis.historical.feed_stall_seconds
+        if last is None or now - last < timedelta(seconds=threshold):
+            return
+        self._feed_stalled = True
+        self.health.set("feed", "stale", f"no packet since {last.isoformat()}")
+        for sym, rt in self.runtimes.items():
+            if rt.pipeline is not None:
+                rt.pipeline.set_stale(now)
+            sh = self.health.symbol(sym)
+            if sh.state == "LIVE":
+                self.health.set_symbol_state(sym, "STALE", f"feed stalled: no packet since {last.isoformat()}")
+        self.events.emit(EventType.FEED_STALLED, f"feed stalled: no packet since {last.isoformat()}", severity=Severity.WARNING,
+                         dedupe_key=f"feed:stalled:gen:{self._feed_generation}", agent="market_feed_agent", last_packet_at=last.isoformat())
+
+    def _on_feed_resumed(self, now: datetime) -> None:
+        if not self._feed_stalled:
+            return
+        self._feed_stalled = False
+        self.health.set("feed", "connected", "delivery resumed")
+        self.events.clear_key(f"feed:stalled:gen:{self._feed_generation}")
+        self.events.emit(EventType.FEED_RECOVERED, "feed delivery resumed; stalled minutes are broker-verified", agent="market_feed_agent",
+                         dedupe_key=f"feed:recovered:gen:{self._feed_generation}")
+        for sym in self.runtimes:
+            self._settle_symbol_state(sym, True)
 
     def _on_gap(self, sym: str, gap: GapRecord) -> None:
         rt = self.runtimes.get(sym)
         if rt is None or self.continuity is None:
             return
         self.continuity.record_gap(rt.contract, gap)
+        self.continuity.incidents.open(sym, rt.contract.security_id, KIND_GAP, gap.timeframe, gap.open_time, "gap_detected")
         self.health.set_symbol_state(sym, "ERROR", f"data gap {gap.timeframe.value} {gap.open_time.isoformat()} missing={len(gap.missing)}",
                                      unresolved_gaps=len(rt.pipeline.unresolved_gaps) if rt.pipeline else 1)
+        self.events.emit(EventType.DATA_GAP, f"{sym} {gap.timeframe.value} {gap.open_time.isoformat()} gap: {gap.present}/{gap.expected} constituents",
+                         severity=Severity.ERROR, dedupe_key=f"gap:{rt.contract.security_id}:{gap.timeframe.value}:{gap.open_time.isoformat()}",
+                         agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id, timeframe=gap.timeframe.value,
+                         open_time=gap.open_time.isoformat(), missing=len(gap.missing))
         self._spawn(self.repair(sym), name=f"repair:{sym}")
 
     def _on_pending(self, sym: str, minute: datetime, reason: str) -> None:
         """A minute without trustworthy live coverage: verify it against the broker, never invent it."""
         rt = self.runtimes.get(sym)
-        if rt is None:
+        if rt is None or self.continuity is None:
             return
+        self.continuity.incidents.open(sym, rt.contract.security_id, KIND_PENDING_MINUTE, Timeframe.M1, minute, reason)
         sh = self.health.symbol(sym)
         if sh.state in ("LIVE", "STALE"):
-            state = "STALE" if reason == "silent_feed" else "RECOVERING_GAP"
+            state = "STALE" if reason in (REASON_SILENT, REASON_SUSPECT) else "RECOVERING_GAP"
             self.health.set_symbol_state(sym, state, f"minute {minute.isoformat()} needs broker verification ({reason})")
-        if rt.pipeline is not None and not rt.pipeline.recovering:
-            self._spawn(self.verify(sym), name=f"verify:{sym}")
+        self.events.emit(EventType.M1_PENDING, f"{sym} minute {minute.isoformat()} needs broker verification ({reason})",
+                         severity=Severity.WARNING, dedupe_key=f"m1:pending:{rt.contract.security_id}:{minute.isoformat()}",
+                         agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id, minute=minute.isoformat(), reason=reason)
+        self._continuity_tick()
+
+    # ------------------------------------------------------- continuity ops
+    # Every operation: worker thread fetches (immutable FetchResult) -> event loop applies.
+    def _begin(self, sym: str, op: str) -> bool:
+        if self._inflight.get((sym, op)):
+            return False
+        self._inflight[(sym, op)] = True
+        return True
+
+    def _end(self, sym: str, op: str) -> None:
+        self._inflight[(sym, op)] = False
 
     async def verify(self, sym: str) -> bool:
-        """Verify pending minutes with exact broker M1 bars (bounded retries, then ERROR)."""
+        """One verification attempt for the symbol's pending minutes; the incident schedule decides the next one."""
         rt = self.runtimes.get(sym)
         if rt is None or rt.pipeline is None or self.continuity is None:
             return False
-        if self._verify_inflight.get(sym):
+        if not self._begin(sym, "verify"):
             return False
         self._verify_inflight[sym] = True
         try:
             p = rt.pipeline
-            retries = self.cfg.analysis.historical.verification_retries if self.cfg else 3
-            for attempt in range(1, retries + 1):
-                if not [m for m in p.pending_minutes() if m + timedelta(minutes=1) <= self._now()]:
-                    break
-                try:
-                    verified, still = await asyncio.to_thread(self.continuity.verify_pending, rt.contract, p)
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("verification_error %s", kv(symbol=sym, error=type(exc).__name__))
-                    verified, still = 0, len(p.pending_minutes())
-                if not [m for m in p.pending_minutes() if m + timedelta(minutes=1) <= self._now()]:
-                    break
-                if attempt < retries:
-                    try:
-                        await asyncio.wait_for(self.stop.wait(), timeout=0.5 * self.task_backoff_scale)
-                        return False
-                    except asyncio.TimeoutError:
-                        pass
+            window = self.continuity.verification_window(p)
+            if window is None:
+                return self._settle_symbol_state(sym, True)
+            incs = [i for i in self.continuity.incidents.open_for(rt.contract.security_id, KIND_PENDING_MINUTE)
+                    if i.open_time + timedelta(minutes=1) <= self._now()]
+            self.continuity.incidents.attempt_started(incs)
+            self.events.emit(EventType.M1_VERIFICATION_STARTED, f"{sym} verifying {len(incs)} minute(s) with the broker",
+                             dedupe_key=f"m1:verify:{rt.contract.security_id}:{window[0].isoformat()}", agent="continuity_agent", symbol=sym,
+                             security_id=rt.contract.security_id, minutes=len(incs))
+            try:
+                result = await asyncio.to_thread(self.continuity.fetch_m1, rt.contract, window[0], window[1])
+            except Exception as exc:  # noqa: BLE001
+                log.exception("verification_error %s", kv(symbol=sym, error=type(exc).__name__))
+                self.continuity.incidents.attempt_failed(incs, f"{type(exc).__name__}: {exc}")
+                return self._settle_symbol_state(sym, True)
+            verified, still = self.continuity.apply_verification(rt.contract, p, result)
+            for m in verified:
+                self.continuity.incidents.resolve(rt.contract.security_id, KIND_PENDING_MINUTE, Timeframe.M1, m, "broker_m1")
+            if verified:
+                self.events.emit(EventType.M1_VERIFIED, f"{sym} {len(verified)} minute(s) replaced by broker M1 ({verified[0].isoformat()}..)",
+                                 agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id, minutes=[m.isoformat() for m in verified])
+            unresolved = [i for i in incs if i.open_time in still]
+            if unresolved:
+                error = result.error or "broker has not published the minute yet"
+                self.continuity.incidents.attempt_failed(unresolved, error)
+                self.events.emit(EventType.M1_VERIFICATION_FAILED, f"{sym} {len(unresolved)} minute(s) still unverified: {error[:80]}",
+                                 severity=Severity.WARNING, dedupe_key=f"m1:unverified:{rt.contract.security_id}:{unresolved[0].open_time.isoformat()}",
+                                 agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id, attempts=unresolved[0].attempt_count)
             return self._settle_symbol_state(sym, True)
         finally:
             self._verify_inflight[sym] = False
+            self._end(sym, "verify")
+
+    async def reconcile(self, sym: str) -> int:
+        """Reconcile mode: compare trusted live M1 bars with the broker's after the configured delay."""
+        rt = self.runtimes.get(sym)
+        if rt is None or rt.pipeline is None or self.continuity is None or self.cfg is None:
+            return 0
+        if not self._begin(sym, "reconcile"):
+            return 0
+        try:
+            window = self.continuity.reconcile_window(rt.pipeline, self.cfg.analysis.historical.reconcile_delay_seconds)
+            if window is None:
+                return 0
+            try:
+                result = await asyncio.to_thread(self.continuity.fetch_m1, rt.contract, window[0], window[1])
+            except Exception as exc:  # noqa: BLE001
+                log.exception("reconcile_error %s", kv(symbol=sym, error=type(exc).__name__))
+                return 0
+            if not result.ok:
+                return 0
+            results = rt.pipeline.reconcile_m1(list(result.candles))
+            for r in results:
+                if r.matched:
+                    continue
+                self.events.emit(EventType.M1_MISMATCH,
+                                 f"{sym} live M1 {r.minute.isoformat()} differs from broker on {', '.join(r.differences)}"
+                                 + (" (replaced in open bucket)" if r.replaced_in_open_bucket else " (bar already closed: reported only)"),
+                                 severity=Severity.ERROR, agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id,
+                                 minute=r.minute.isoformat(), fields=list(r.differences), replaced=r.replaced_in_open_bucket,
+                                 local={"o": r.local.open, "h": r.local.high, "l": r.local.low, "c": r.local.close, "v": r.local.volume},
+                                 broker={"o": r.broker.open, "h": r.broker.high, "l": r.broker.low, "c": r.broker.close, "v": r.broker.volume} if r.broker else None)
+            return len(results)
+        finally:
+            self._end(sym, "reconcile")
 
     async def recover_all(self) -> None:
         for sym in list(self.runtimes):
@@ -359,13 +523,19 @@ class Application:
         p = rt.pipeline
         if p.recovering:
             return False
+        fallback = rt.history.get(self.cfg.primary_timeframe, [])[-1].close_time if rt.history.get(self.cfg.primary_timeframe) else None
+        window = self.continuity.recovery_window(p, fallback)
+        if window is None:
+            return self._settle_symbol_state(sym, True)
         p.begin_recovery()
+        self.health.set_symbol_state(sym, "RECOVERING_GAP", f"backfilling M1 from {window[0].isoformat()} to {window[1].isoformat()}")
+        ok = False
         try:
-            fallback = rt.history.get(self.cfg.primary_timeframe, [])[-1].close_time if rt.history.get(self.cfg.primary_timeframe) else None
-            ok = await asyncio.to_thread(self.continuity.recover, rt.contract, p, fallback)
+            result = await asyncio.to_thread(self.continuity.fetch_m1, rt.contract, window[0], window[1], self.continuity.retries)
+            outcome = self.continuity.apply_recovery(rt.contract, p, result)
+            ok = outcome.ok
         except Exception as exc:  # noqa: BLE001
             log.exception("recovery_error %s", kv(symbol=sym, error=type(exc).__name__))
-            ok = False
         finally:
             p.end_recovery()
         return self._settle_symbol_state(sym, ok)
@@ -374,26 +544,104 @@ class Application:
         rt = self.runtimes.get(sym)
         if rt is None or rt.pipeline is None or self.continuity is None:
             return False
+        if not self._begin(sym, "repair"):
+            return False
         try:
-            await asyncio.to_thread(self.continuity.repair, rt.contract, rt.pipeline)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("repair_error %s", kv(symbol=sym, error=type(exc).__name__))
-        return self._settle_symbol_state(sym, True)
+            for gap in list(rt.pipeline.unresolved_gaps):
+                inc = self.continuity.incidents.open(sym, rt.contract.security_id, KIND_GAP, gap.timeframe, gap.open_time, "gap_detected")
+                self.continuity.incidents.attempt_started([inc])
+                try:
+                    result = await asyncio.to_thread(self.continuity.fetch_gap_candle, rt.contract, gap.timeframe, gap.open_time)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("repair_error %s", kv(symbol=sym, error=type(exc).__name__))
+                    self.continuity.incidents.attempt_failed([inc], f"{type(exc).__name__}: {exc}")
+                    break
+                if gap.resolved:  # a late verified constituent completed the bucket meanwhile
+                    self.continuity.incidents.resolve(rt.contract.security_id, KIND_GAP, gap.timeframe, gap.open_time, "constituents_verified")
+                    continue
+                if not self.continuity.apply_repair(rt.contract, rt.pipeline, gap, result):
+                    self.continuity.incidents.attempt_failed([inc], result.error or "broker candle not available yet")
+                    break
+                self.continuity.incidents.resolve(rt.contract.security_id, KIND_GAP, gap.timeframe, gap.open_time, "broker_candle")
+                self.events.emit(EventType.DATA_GAP_REPAIRED, f"{sym} {gap.timeframe.value} {gap.open_time.isoformat()} repaired with the broker candle",
+                                 agent="continuity_agent", symbol=sym, security_id=rt.contract.security_id, timeframe=gap.timeframe.value,
+                                 open_time=gap.open_time.isoformat())
+            return self._settle_symbol_state(sym, True)
+        finally:
+            self._end(sym, "repair")
+
+    def _continuity_tick(self) -> None:
+        """Retry scheduler (called every second and on new incidents): due incidents are retried
+        while the market is open and the minute is relevant; stale ones are ABANDONED (recorded)."""
+        if self.continuity is None or self._loop is None or self.cfg is None:
+            return
+        now = self._now()
+        tracker = self.continuity.incidents
+        for sym, rt in list(self.runtimes.items()):
+            if rt.pipeline is None:
+                continue
+            sid = rt.contract.security_id
+            for inc in tracker.open_for(sid):
+                if not self.continuity.minute_relevant(inc.open_time, now):
+                    tracker.abandon(inc, "trading_day_over")
+                    if inc.kind == KIND_PENDING_MINUTE:
+                        rt.pipeline.pending_verification.pop(inc.open_time, None)
+                    self.events.emit(EventType.M1_ABANDONED, f"{sym} {inc.kind} {inc.open_time.isoformat()} unresolved when its trading day ended "
+                                     f"(attempts={inc.attempt_count}); kept on record, never filled", severity=Severity.ERROR,
+                                     agent="continuity_agent", symbol=sym, security_id=sid, kind=inc.kind, open_time=inc.open_time.isoformat())
+            if rt.pipeline.recovering or not self._retry_allowed(now):
+                continue
+            if tracker.due(now, sid, KIND_PENDING_MINUTE) and not self._inflight.get((sym, "verify")):
+                self._spawn(self.verify(sym), name=f"verify:{sym}")
+            if tracker.due(now, sid, KIND_GAP) and not self._inflight.get((sym, "repair")):
+                self._spawn(self.repair(sym), name=f"repair:{sym}")
+            if rt.pipeline.reconcile_live_m1 and rt.pipeline.reconcile_queue and not self._inflight.get((sym, "reconcile")):
+                if self.continuity.reconcile_window(rt.pipeline, self.cfg.analysis.historical.reconcile_delay_seconds) is not None:
+                    self._spawn(self.reconcile(sym), name=f"reconcile:{sym}")
+
+    def _retry_allowed(self, now: datetime) -> bool:
+        """Retries run while the market is open, plus a short grace after the close."""
+        assert self.calendar is not None
+        if self.calendar.is_open(now):
+            return True
+        d = self.calendar.trading_date(now)
+        if not self.calendar.is_trading_day(d):
+            return False
+        _, end = self.calendar.trading_day_span(d)
+        return end <= now <= end + timedelta(minutes=10)
+
+    def _sync_incidents(self, sym: str) -> None:
+        """Incidents whose condition the pipeline no longer reports are RESOLVED (e.g. a pending
+        minute delivered by reconnect recovery, a gap completed by late verified constituents)."""
+        rt = self.runtimes.get(sym)
+        if rt is None or rt.pipeline is None or self.continuity is None:
+            return
+        p, sid = rt.pipeline, rt.contract.security_id
+        for inc in self.continuity.incidents.open_for(sid):
+            if inc.kind == KIND_PENDING_MINUTE and inc.open_time not in p.pending_verification and inc.open_time in p._seen_m1:
+                self.continuity.incidents.resolve(sid, KIND_PENDING_MINUTE, Timeframe.M1, inc.open_time, "broker_m1")
+            elif inc.kind == KIND_GAP and not any(g.open_time == inc.open_time and g.timeframe is inc.timeframe and not g.resolved for g in p.gaps):
+                self.continuity.incidents.resolve(sid, KIND_GAP, inc.timeframe, inc.open_time, "repaired")
 
     def _settle_symbol_state(self, sym: str, recovered: bool) -> bool:
         rt = self.runtimes[sym]
         p = rt.pipeline
-        assert p is not None
+        assert p is not None and self.cfg is not None and self.continuity is not None
+        self._sync_incidents(sym)
+        now = self._now()
         gaps = len(p.unresolved_gaps)
         pending = p.pending_minutes()
-        closed_pending = [m for m in pending if m + timedelta(minutes=1) <= self._now()]
+        closed_pending = [m for m in pending if m + timedelta(minutes=1) <= now]
         if recovered and p.continuity_ok:
-            partial = p.current_minute_partial(self._now())
+            partial = p.current_minute_partial(now)
             if partial is not None:
                 # the minute in progress began before coverage did (mid-minute connect,
                 # reconnect or rollover): its trust is unknown until the broker M1 replaces it
                 self.health.set_symbol_state(sym, "RECOVERING_GAP", f"current minute {partial.isoformat()} is partial; "
                                              "awaiting broker verification", unresolved_gaps=0)
+                return False
+            if p.feed_stale:
+                self.health.set_symbol_state(sym, "STALE", "feed stalled; awaiting delivery", unresolved_gaps=0)
                 return False
             self.health.set_symbol_state(sym, "LIVE", "continuity verified", unresolved_gaps=0)
             return True
@@ -406,8 +654,23 @@ class Application:
             detail = f"{len(closed_pending)} minute(s) unverified by broker; analytics suspended"
         else:
             detail = f"unresolved gaps={gaps}" if gaps else "recovery failed; analytics suspended"
-        self.health.set_symbol_state(sym, "ERROR", detail, unresolved_gaps=gaps + len(closed_pending))
-        self.sink.status(self.health.status_line())
+        # incident age decides how loudly we complain; retries continue in every state
+        oldest = self.continuity.incidents.oldest_open(rt.contract.security_id)
+        age = oldest.age(now).total_seconds() if oldest is not None else None
+        h = self.cfg.analysis.historical
+        if not recovered:
+            state = "ERROR"
+        elif age is None or age < h.degraded_after_seconds:
+            state = "RECOVERING_GAP"
+        elif age < h.error_after_seconds:
+            state = "DEGRADED"
+        else:
+            state = "ERROR"
+        if oldest is not None:
+            detail += f"; retrying (attempts={oldest.attempt_count}, next={oldest.next_retry_at.isoformat()})"
+        self.health.set_symbol_state(sym, state, detail, unresolved_gaps=gaps + len(closed_pending))
+        if state == "ERROR":
+            self.sink.status(self.health.status_line())
         return False
 
     # -------------------------------------------------------------- live run
@@ -416,6 +679,11 @@ class Application:
         cfg = self.cfg
         self.stop = asyncio.Event()
         self._loop = asyncio.get_running_loop()
+        # every pipeline / health mutation happens on this thread; workers only fetch
+        self.health.bind_to_current_thread()
+        for rt in self.runtimes.values():
+            if rt.pipeline is not None:
+                rt.pipeline.bind_to_current_thread()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._loop.add_signal_handler(sig, self.stop.set)
@@ -448,6 +716,11 @@ class Application:
                                              cfg.env.EXCHANGE_SEGMENT, self._on_tick, self._on_feed_status)
         await self.feed.subscribe(ids)
         self._build_pipelines()
+        for rt in self.runtimes.values():
+            if rt.pipeline is not None:
+                rt.pipeline.bind_to_current_thread()
+        self.events.emit(EventType.APP_STARTED, "Aureon observer starting: " + ", ".join(f"{s}={c.security_id}" for s, c in self.contracts.items()),
+                         agent="health_agent")
         self._specs["feed"] = TaskSpec("feed", lambda: self.feed.run(self.stop), critical=True)
         self._start("feed")
         self._step(10, "websocket connecting")
@@ -549,8 +822,10 @@ class Application:
             now = self._now() - grace
             for p in self.pipelines.values():
                 p.flush_at(now)  # exceptions propagate to the supervisor (never swallowed)
+            self._feed_watchdog(self._now())
+            self._continuity_tick()
             try:
-                await asyncio.wait_for(self.stop.wait(), timeout=1.0)
+                await asyncio.wait_for(self.stop.wait(), timeout=self.flush_interval)
             except asyncio.TimeoutError:
                 pass
 
@@ -618,14 +893,22 @@ class Application:
         old_rt = self.runtimes[sym]
         old = old_rt.contract
         log.warning("rollover_begin %s", kv(logical=sym, old_security_id=old.security_id, new_security_id=new.security_id, expiry=new.expiry_iso))
+        self.health.set_symbol_state(sym, "ROLLOVER_WARMING", f"preparing {new.security_id}", security_id=old.security_id, expiry=old.expiry_iso)
+        self.events.emit(EventType.ROLLOVER_STARTED, f"{sym} rollover: warming {new.security_id} (expiry {new.expiry_iso}) to replace {old.security_id}",
+                         agent="rollover_agent", symbol=sym, security_id=new.security_id, old_security_id=old.security_id)
         try:
-            new_rt = await asyncio.to_thread(self._prepare_symbol, sym, new, "ROLLOVER_WARMING")
+            new_rt = await asyncio.to_thread(self._prepare_symbol, sym, new)
+            new_rt.observer.health = self.health           # warmed against a scratch HealthState in the worker
+            assert new_rt.pipeline is not None
+            new_rt.pipeline.bind_to_current_thread()
         except (StartupError, DhanError, Exception) as exc:  # noqa: BLE001
             log.error("rollover_failed %s", kv(logical=sym, new_security_id=new.security_id, error=type(exc).__name__, detail=str(exc)[:200]))
             self.health.set_symbol_state(sym, "LIVE" if old_rt.pipeline is not None and old_rt.pipeline.continuity_ok else "ERROR",
                                          f"rollover to {new.security_id} failed: {type(exc).__name__}; old contract retained",
                                          security_id=old.security_id, expiry=old.expiry_iso)
             self.sink.status(f"{sym} rollover to security_id {new.security_id} FAILED; keeping {old.security_id}")
+            self.events.emit(EventType.ROLLOVER_FAILED, f"{sym} rollover to {new.security_id} failed: {type(exc).__name__}; keeping {old.security_id}",
+                             severity=Severity.ERROR, agent="rollover_agent", symbol=sym, security_id=old.security_id)
             return False
         ind = new_rt.observer.indicators[self.cfg.primary_timeframe].latest
         if ind is None or not ind.warmed:
@@ -660,6 +943,8 @@ class Application:
                                      security_id=new.security_id, expiry=new.expiry_iso, unresolved_gaps=0, feed_connected=feed_connected)
         log.warning("rollover_switched %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso))
         self.sink.status(f"{sym} rolled -> security_id {new.security_id} -> expiry {new.expiry_iso} (verifying continuity)")
+        self.events.emit(EventType.ROLLOVER_SWITCHED, f"{sym} subscription switched {old.security_id} -> {new.security_id} (expiry {new.expiry_iso}); verifying continuity",
+                         agent="rollover_agent", symbol=sym, security_id=new.security_id, old_security_id=old.security_id)
         if feed_connected:
             ok = await self.recover(sym)
         else:
@@ -668,6 +953,8 @@ class Application:
                                          security_id=new.security_id, expiry=new.expiry_iso)
         log.warning("rollover_complete %s", kv(logical=sym, security_id=new.security_id, expiry=new.expiry_iso,
                                                  state=self.health.symbol(sym).state))
+        self.events.emit(EventType.ROLLOVER_COMPLETED, f"{sym} rollover complete: {new.security_id} state={self.health.symbol(sym).state}",
+                         agent="rollover_agent", symbol=sym, security_id=new.security_id, state=self.health.symbol(sym).state)
         return ok
 
     # --------------------------------------------------------------- shutdown
@@ -675,6 +962,7 @@ class Application:
         log.info("shutdown_begin")
         if self.stop is not None:
             self.stop.set()
+        self.events.emit(EventType.APP_STOPPED, "Aureon observer stopping", agent="health_agent")
         if self.feed is not None and hasattr(self.feed, "disconnect"):
             try:
                 await self.feed.disconnect()
@@ -696,6 +984,11 @@ class Application:
         if self.http is not None and hasattr(self.http, "close"):
             self.http.close()
         log.info("shutdown_complete")
+
+
+def _safe(detail: dict) -> dict:
+    """Event payload from a feed status detail: primitives only, never credentials."""
+    return {k: v for k, v in detail.items() if isinstance(v, (int, float, str, bool)) and k not in ("token", "client_id")}
 
 
 def main(argv: list[str] | None = None) -> int:

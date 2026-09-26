@@ -459,8 +459,32 @@ class HistoricalSpec(StrictModel):
     # guarantee, so the safe default is False: the minute stays unresolved and the symbol
     # untrusted until the broker returns it.
     allow_verified_zero_trade_fill: bool = False
-    # Bounded retries for broker M1 verification / recovery before the symbol is marked ERROR.
+    # Fetch attempts inside ONE recovery / verification call (transport failures).
     verification_retries: int = Field(default=3, ge=1)
+    # Persistent retry schedule (seconds) for unresolved minutes / gaps: after the last value
+    # the interval stays constant. Retrying continues while the market is open and the minute
+    # belongs to the current trading day; nothing is ever busy-looped.
+    verification_backoff_seconds: list[float] = Field(default_factory=lambda: [2.0, 5.0, 10.0, 20.0, 30.0, 60.0])
+    # Symbol state while an incident stays unresolved: RECOVERING_GAP until degraded_after,
+    # DEGRADED until error_after, then ERROR (retries continue in every state).
+    degraded_after_seconds: float = Field(default=120.0, ge=0)
+    error_after_seconds: float = Field(default=900.0, ge=0)
+    # A connected socket that delivers no packet at all for this long is a STALLED feed: the
+    # open minute becomes SUSPECT and is replaced by the broker's M1 (never trusted locally).
+    feed_stall_seconds: float = Field(default=15.0, gt=0)
+    # Research-validation mode: every trusted live M1 is compared with the broker's M1
+    # `reconcile_delay_seconds` after it closes; mismatches are counted, reported and, when the
+    # primary bucket is still open, the broker bar replaces the local one.
+    reconcile_every_live_m1: bool = False
+    reconcile_delay_seconds: float = Field(default=20.0, ge=0)
+    reconcile_volume_tolerance: float = Field(default=0.2, ge=0)
+
+    @field_validator("verification_backoff_seconds")
+    @classmethod
+    def _backoff(cls, v: list[float]) -> list[float]:
+        if not v or any(x <= 0 for x in v):
+            raise ValueError("verification_backoff_seconds must be a non-empty list of positive seconds")
+        return v
 
 
 class DiscordSpec(StrictModel):
