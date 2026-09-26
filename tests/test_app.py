@@ -65,10 +65,11 @@ class FakeHttp:
 
 
 class FakeHistorical:
-    def __init__(self, clock, fail_for: set[str] | None = None):
+    def __init__(self, clock, fail_for: set[str] | None = None, anchor: datetime = NOW):
         self.calls = []
         self.clock = clock
         self.fail_for = fail_for or set()
+        self.anchor = anchor  # warmup history ends here (the process start time in the scenario)
 
     def fetch(self, symbol, security_id, seg, itype, expiry, timeframe, start, end):
         self.calls.append((symbol, security_id, timeframe, start, end))
@@ -77,14 +78,14 @@ class FakeHistorical:
         now = self.clock[0]
         if timeframe is Timeframe.M1:
             return [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
-        if start >= NOW:  # live-period broker bars derive from the same fake market as the ticks
+        if start >= self.anchor:  # live-period broker bars derive from the same fake market as the ticks
             m1 = [c for c in m1_for(security_id, start, end, symbol, expiry) if c.close_time <= now]
             return aggregate_closed(m1, timeframe) if m1 else []
-        # per-timeframe broker series ending at NOW (like the real warmup: exact broker candles per interval)
+        # per-timeframe broker series ending at the anchor (like the real warmup: exact broker candles per interval)
         n = {Timeframe.M5: 240, Timeframe.M15: 300, Timeframe.H1: 200}[timeframe]
         from aureon_mcx.market.timeutil import floor_to
 
-        first = floor_to(NOW - timedelta(seconds=timeframe.seconds * n), timeframe.seconds)  # IST-aligned like Dhan's bars
+        first = floor_to(self.anchor - timedelta(seconds=timeframe.seconds * n), timeframe.seconds)  # IST-aligned like Dhan's bars
         return make_candles(n, start=first, tf=timeframe, symbol=symbol, security_id=security_id, expiry=expiry,
                             prices=trending_prices(n), base=SECURITY_PRICES.get(security_id, 70000.0))
 
@@ -157,18 +158,71 @@ class FakeFeed:
         self.disconnected = True
 
 
-def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwargs=None, fail_for=None):
+class FakeScannerFeed:
+    """Scanner feed partition: delivers scripted FeedPackets (default none) and waits for stop."""
+
+    def __init__(self, on_packet, index=0, packets=None):
+        self.on_packet = on_packet
+        self.index = index
+        self.packets = list(packets or [])
+        self.subscribed: list[str] = []
+        self.connected = False
+        self.disconnected = False
+        self.on_status = lambda s, d: None
+
+    async def subscribe(self, ids):
+        self.subscribed += list(ids)
+
+    async def unsubscribe(self, ids):
+        self.subscribed = [s for s in self.subscribed if s not in ids]
+
+    async def run(self, stop):
+        self.connected = True
+        self.on_status("connected", {"reconnects": 0})
+        for p in self.packets:
+            self.on_packet(p)
+            await asyncio.sleep(0)
+        await stop.wait()
+        self.connected = False
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+def _config_dir(tmp_path, analysis_updates: dict | None = None):
+    """Copy the repo config into tmp_path and patch analysis.yaml sections (nested dict merge)."""
+    import shutil
+
+    import yaml
+
+    cdir = tmp_path / "config"
+    if not cdir.exists():
+        shutil.copytree(ROOT / "config", cdir)
+    if analysis_updates:
+        data = yaml.safe_load((cdir / "analysis.yaml").read_text()) or {}
+        for section, values in analysis_updates.items():
+            data.setdefault(section, {}).update(values)
+        (cdir / "analysis.yaml").write_text(yaml.safe_dump(data))
+    return cdir
+
+
+def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwargs=None, fail_for=None, historical=None,
+         analysis_updates=None, feed_stall_seconds=3600.0, flush_interval=0.05, scanner_packets=None):
+    """Build an Application over fakes. The fake feed's clock jumps ~15 s between ticks, so the
+    socket-stall watchdog is disabled by default (tests that exercise it set a threshold)."""
     monkeypatch.setenv("DHAN_CLIENT_ID", "cid-1")
     monkeypatch.setenv("DHAN_ACCESS_TOKEN", "tok-secret-1")
     monkeypatch.setenv("AUREON_LOCAL_DB_PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("SYMBOLS", symbols)
+    monkeypatch.setenv("AUREON_API_ENABLED", "false")  # the API server is exercised by tests/test_api.py
     monkeypatch.chdir(tmp_path)
     from aureon_mcx.broker.dhan.instruments import DhanInstrumentProvider
 
     clock = [NOW]
     fake_http = FakeHttp(profile_ok)
-    hist = FakeHistorical(clock, fail_for)
+    hist = historical(clock) if historical is not None else FakeHistorical(clock, fail_for)
     feeds = []
+    config_dir = _config_dir(tmp_path, analysis_updates) if analysis_updates else ROOT / "config"
 
     holder = {}
 
@@ -184,10 +238,20 @@ def _app(tmp_path, monkeypatch, profile_ok=True, symbols="GOLD,SILVER", feed_kwa
         feeds.append(f)
         return f
 
-    app = Application(config_dir=str(ROOT / "config"), env_file=str(tmp_path / "none.env"), http_factory=lambda cfg: fake_http,
+    scanner_feeds = []
+
+    def scanner_feed_factory(cfg, on_packet, index):
+        f = FakeScannerFeed(on_packet, index, scanner_packets if index == 0 else None)
+        scanner_feeds.append(f)
+        return f
+
+    app = Application(config_dir=str(config_dir), env_file=str(tmp_path / "none.env"), http_factory=lambda cfg: fake_http,
                       instrument_provider_factory=lambda cfg, http: DhanInstrumentProvider("u", tmp_path / "m.csv", 24, http, now=lambda: NOW),
                       historical_factory=lambda cfg, http: hist, feed_factory=feed_factory,
-                      sink_factory=lambda cfg, repos: (NullSink(), None), now=lambda: clock[0], housekeeping_interval=0.2)
+                      sink_factory=lambda cfg, repos: (NullSink(), None), now=lambda: clock[0], housekeeping_interval=0.2,
+                      flush_interval=flush_interval, feed_stall_seconds=feed_stall_seconds, scanner_feed_factory=scanner_feed_factory,
+                      scanner_interval=0.1)
+    app.test_scanner_feeds = scanner_feeds
     holder["app"] = app
     return app, fake_http, hist, feeds, clock
 
@@ -314,7 +378,12 @@ def test_recovery_failure_fails_closed(tmp_path, monkeypatch):
     hist.fail_for = {"428291"}  # historical API unavailable during the run
     asyncio.run(app.run())
     sh = app.health.symbols["GOLD"]
-    assert sh.state == "ERROR" and not app.health.ok
+    # the broker never answered: the symbol degrades with age (RECOVERING_GAP -> DEGRADED -> ERROR) and
+    # never LIVE; retries kept running on the incident schedule without a reconnect
+    assert sh.state in ("DEGRADED", "ERROR") and not app.health.ok
+    open_incidents = app.continuity.incidents.open_for("428291")
+    assert open_incidents and max(i.attempt_count for i in open_incidents) >= 2
+    assert all(i.last_error and "simulated failure" in i.last_error for i in open_incidents if i.attempt_count)
     p = app.pipelines["428291"]
     assert p.suspended or not p.continuity_ok
     # the gap bar never reached the observer; analytics stopped at the gap
@@ -597,7 +666,9 @@ def test_supervisor_restarts_tasks_that_return_normally_while_running(tmp_path, 
             await super().run(stop)
 
     def feed_factory(cfg, on_tick, health):
-        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",))
+        # the run only ends once every silently-returned task has actually been restarted, so the
+        # assertions below do not depend on how quickly the loop schedules the restarts
+        f = QuietlyReturningFeed(on_tick, clock, minutes=3, ids=("428291",), settle=lambda: quiet.starts >= 2 and attempts["flush"] >= 2)
         feeds.append(f)
         return f
 
@@ -657,3 +728,74 @@ def test_critical_task_repeated_failure_shuts_down_safely(tmp_path, monkeypatch)
     assert app.stop.is_set()
     assert app.health.components["observer"].status == "error" and app.health.components["feed"].status == "error"
     assert sum(1 for n, _ in app.task_failures if n == "feed") == 6  # initial + 5 restarts
+
+
+def test_startup_fails_closed_outside_calendar_years(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    clock[0] = datetime(2027, 1, 2, 5, 0, tzinfo=timezone.utc)
+    with pytest.raises(StartupError, match="CALENDAR_OUT_OF_RANGE: MCX calendar for 2027 not installed"):
+        app.startup()
+    assert app.health.components["calendar"].status == "error"
+    assert app.runtimes == {}  # nothing was resolved or warmed under normal-trading assumptions
+
+
+def test_live_run_fails_closed_when_calendar_year_ends(tmp_path, monkeypatch):
+    from aureon_mcx.events import EventType
+
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+
+    def feed_factory(cfg, on_tick, health):
+        f = FakeFeed(on_tick, clock, minutes=8, ids=("428291",))
+
+        async def run(stop):
+            f.connected = True
+            f.on_status("connected", {"reconnects": 0})
+            await asyncio.sleep(0.3)
+            series = m1_for("428291", NOW, NOW + timedelta(minutes=8))
+            for i in range(0, 6):
+                for t in ticks_for(series[i]):
+                    clock[0] = t.ts
+                    on_tick(t)
+                await f.wait_settled()
+            assert app.health.symbols["GOLD"].state == "LIVE"
+            clock[0] = datetime(2027, 1, 4, 5, 0, tzinfo=timezone.utc)  # the calendar year ended while running
+            await asyncio.sleep(1.0)  # housekeeping (0.2 s) notices
+            stop.set()
+
+        f.run = run
+        return f
+
+    app._feed_factory = feed_factory
+    asyncio.run(app.run())
+    assert app.health.components["calendar"].status == "error" and "2027 not installed" in app.health.components["calendar"].detail
+    assert app.health.symbols["GOLD"].state == "ERROR" and "CALENDAR_OUT_OF_RANGE" in app.health.symbols["GOLD"].detail
+    failures = [e for e in app.events.history if e.type is EventType.CALENDAR_FAILURE]
+    assert len(failures) == 1 and "MCX calendar for 2027 not installed" in failures[0].message
+    assert app.pipelines["428291"].gaps == [] or all(g.open_time < datetime(2027, 1, 1, tzinfo=timezone.utc) for g in app.pipelines["428291"].gaps)
+    assert app.task_failures == []
+
+
+def test_scanner_runs_beside_the_observer(tmp_path, monkeypatch):
+    from tests.test_scanner import prev_close_packet, quote_packet
+
+    packets = [prev_close_packet(428291, 70000.0), quote_packet(428291, 70700.0), prev_close_packet(429004, 84000.0),
+               quote_packet(429004, 83160.0), quote_packet(428294, 5900.0)]
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD", feed_kwargs={"minutes": 3, "ids": ("428291",)},
+                                         scanner_packets=packets)
+    app.startup()
+    assert app.scanner is not None and app.scanner.universe_size == 8  # front-month MCX futures from the fixture master
+    asyncio.run(app.run())
+    sf = app.test_scanner_feeds
+    assert len(sf) == 1 and sorted(sf[0].subscribed) == sorted(app.scanner.security_ids()) and sf[0].disconnected
+    board = app.scanner.leaderboard(clock[0])
+    assert board["universe"] == 8
+    winners = [(w["symbol"], round(w["change_pct"], 2)) for w in board["winners"]]
+    losers = [(l["symbol"], round(l["change_pct"], 2)) for l in board["losers"]]
+    assert winners == [("GOLD", 1.0), ("SILVERM", -1.0)] and losers == [("SILVERM", -1.0), ("GOLD", 1.0)]
+    assert app.scanner.quotes["428294"].change_pct is None  # no verified previous close: never a fabricated %
+    b = board["breadth"]["overall"]
+    assert (b["advancing"], b["declining"], b["unavailable"]) == (1, 1, 6)
+    assert app.agents.get("scanner_agent").work_count >= 1 and app.agents.get("scanner_agent").details["universe"] == 8
+    assert app.health.symbols["GOLD"].state == "LIVE"  # tier-2 observation is unaffected
+    assert app.metrics.get("scanner_updates") >= 1 and app.scanner.repos is not None  # periodic snapshots are wired (cadence tested in test_scanner)

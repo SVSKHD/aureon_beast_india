@@ -62,14 +62,20 @@ tests/                         pytest suite (recorded fixtures, no network)
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # fill DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN / DISCORD_*
-pytest                          # 130+ tests, no network
+pytest                          # 240+ tests, no network
 python main_aureon.py           # optional: --config-dir config --env-file .env
+python -m aureon_mcx.tools.audit_database --db data/aureon_mcx.db --json   # read-only integrity audit
 ```
+
+The process serves a read-only status API on `0.0.0.0:1250` (`AUREON_API_HOST` / `AUREON_API_PORT`,
+`AUREON_API_ENABLED=false` disables it). `docker compose up` or the `Jenkinsfile` run the same
+single process in a container with persistent volumes (see *Deployment* below).
 
 `.env` keys (see `.env.example`): `BROKER`, `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, `SYMBOLS`,
 `EXCHANGE_SEGMENT`, `PRIMARY_TIMEFRAME`, `EMA_FAST`, `EMA_SLOW`, `RSI_PERIOD`, `ATR_PERIOD`,
 `SWING_STRENGTH`, `MTF`, `AUREON_STORAGE_BACKEND`, `AUREON_LOCAL_DB_PATH`, `AUREON_CONFIG_DIR`,
-`AUREON_PARQUET_ARCHIVE`, `DISCORD_TOKEN`, `DISCORD_CHANNEL_ID`, `DISCORD_GUILD_ID`.
+`AUREON_PARQUET_ARCHIVE`, `AUREON_API_ENABLED`, `AUREON_API_HOST`, `AUREON_API_PORT`, `AUREON_GIT_SHA`,
+`DISCORD_TOKEN`, `DISCORD_CHANNEL_ID`, `DISCORD_GUILD_ID`.
 
 YAML (all validated with pydantic, `extra=forbid`, startup aborts on any error):
 
@@ -78,7 +84,9 @@ YAML (all validated with pydantic, `extra=forbid`, startup aborts on any error):
 | `config/symbols.yaml` | instrument-master URL/cache, rollover window, per-symbol `underlying`, segment, `FUTCOM`, `contract_policy` enum |
 | `config/sessions.yaml` | timezone, trading day, global sessions (ASIA/LONDON/NEW_YORK) and MCX local sessions, trend thresholds |
 | `config/confirmation_policy.yaml` | `policy_version`, RSI threshold, every rule toggleable |
-| `config/analysis.yaml` | EMA-approach thresholds, structure tolerance, wick rules, liquidity/breakout params, RSI levels, de-clutter limits, horizons, cohort minimum, historical warmup, Discord debounce, `execution.enabled=false` |
+| `config/analysis.yaml` | EMA-approach thresholds, structure tolerance, wick rules, liquidity/breakout params, RSI levels, de-clutter limits, horizons, cohort minimum, historical warmup, verification retry schedule / degraded thresholds / feed stall / reconcile mode, Discord debounce, `execution.enabled=false` |
+| `config/exchange_calendar.yaml` | official MCX calendar for one year (holidays, session closures, seasonal 23:30 close, special / pending special sessions); more years in `exchange_calendar_<YEAR>.yaml` or `calendars/*.yaml` |
+| `config/scanner.yaml` | broad-market scanner universe (segments, instrument types, include / exclude globs, front-month only, Dhan feed limits, stale threshold, digest / snapshot cadence, category map) |
 
 ## Startup flow (`python main_aureon.py`)
 
@@ -169,6 +177,114 @@ shuts the service down; a supervised task that *returns* while the service is st
 treated as a failure and restarted the same way; Discord failure degrades to `discord=error`
 and retries while observation continues. A symbol with no tick for 90 s while the exchange is
 open is `STALE`.
+
+## M1 trust, feed stalls and persistent verification
+
+Every live minute carries a trust record (`MinuteTrust`: first / last packet, packet count,
+socket state at open, feed generation, stale transitions, continuity lost, reason) and a state:
+`OPEN_TRUSTED` → `TRUSTED` (admitted to aggregation) or `OPEN_SUSPECT` → `PARTIAL` →
+`AWAITING_BROKER` → `VERIFIED` (the broker's M1 replaced it). A connected socket that delivers
+no packet for `historical.feed_stall_seconds` is a **stalled feed**: the open minute becomes
+SUSPECT and coverage resumes only at the next packet, so the resume minute is PARTIAL. A
+locally built M1 never enters analysis when continuity was lost inside the minute.
+
+Unresolved minutes and gaps are **continuity incidents** (`continuity_incidents` table:
+`first_detected_at`, `last_attempt_at`, `next_retry_at`, `attempt_count`, `last_error`). They
+are retried on `historical.verification_backoff_seconds` (2, 5, 10, 20, 30, 60 s, then every
+60 s) while the minute belongs to the current trading day, without a reconnect and without a
+busy loop; a restart restores them. The symbol is `RECOVERING_GAP` → `DEGRADED`
+(`degraded_after_seconds`) → `ERROR` (`error_after_seconds`) by incident age, `LIVE` again
+with a recovery event when the broker delivers. Incidents are never deleted: they end
+`RESOLVED` or `ABANDONED` (trading day over, recorded and announced).
+
+`historical.reconcile_every_live_m1: true` (research validation) compares every trusted live
+M1 with the broker's after `reconcile_delay_seconds`; mismatches are counted
+(`live_m1_mismatches`), reported to Discord and replace the constituent while the primary
+bucket is still open. Metrics: `live_m1_built`, `live_m1_verified`, `live_m1_mismatches`,
+`partial_m1_replaced`, `silent_m1_replaced`, `suspect_m1_replaced`.
+
+Threading contract: worker threads (`asyncio.to_thread`) only fetch Dhan data and return
+immutable results; every `CandlePipeline` / `HealthState` / observer / Discord mutation runs
+on the event loop (`ThreadAffinityError` otherwise).
+
+## Market state and calendar coverage
+
+`SessionCalendar.market_state(now)` reports `OPEN` or `CLOSED` with a reason (`WEEKEND`,
+`FULL_HOLIDAY`, `MORNING_SESSION_CLOSED`, `EVENING_SESSION_CLOSED`, `OUTSIDE_TRADING_HOURS`,
+`SPECIAL_SESSION_PENDING`, `CALENDAR_OUT_OF_RANGE`), the session (`MORNING` / `EVENING` /
+`SPECIAL`) and the next open / close. While closed nothing is expected: no missing-candle
+incidents, no stale alerts, no verification retries, feeds reconnect slowly, and the scanner
+presents no "live" winners / losers. A trading date outside every configured calendar year is
+`CALENDAR_OUT_OF_RANGE`: startup aborts and live mode fails closed (symbols `ERROR`,
+`CALENDAR_FAILURE` event, "MCX calendar for 2027 not installed"). The shortened last bar of a
+day (23:00 H1 closing 23:30 / 23:55, 23:15 / 23:45 M15) is closed at the exchange close
+(`effective_close_time`), which Dhan normalisation and the cache use.
+
+## Agents, crash reports and events
+
+Major responsibilities are observable **agents** (`market_feed`, `continuity`, `calendar`,
+`aggregation`, `scanner`, `analysis`, `setup`, `outcome`, `rollover`, `storage`, `discord`,
+`api`, `health`) with one status model (`HEALTHY` / `DEGRADED` / `STALE` / `RECOVERING` /
+`RESTARTING` / `ERROR` / `FAILED` / `STOPPED`, heartbeats, last success / error, restart and
+work counts). Every unexpected failure becomes a durable **crash report** (`crash_reports`:
+crash id, component, agent, task, exception class, redacted message and trace, symbol,
+security id, version, git sha, uptime, restart number, recovery result) and the task is
+restarted with backoff; a restarted task that runs cleanly resolves the report, repeated
+critical failure ends in `FAILED` and a graceful shutdown. All operational changes flow
+through the `SystemEventBus` (typed events with dedupe keys, persisted in `system_events`)
+to the agent registry, the API and Discord.
+
+## Status API (read-only, `:1250`)
+
+`GET /api/v1/status` is the one clean report (status, version / git sha / uptime, market,
+agents, symbols, scanner, continuity, crashes, discord); `/api/v1/health` is liveness plus a
+`ready` flag (observation trustworthy); `/agents`, `/agents/{id}`, `/symbols`,
+`/symbols/{symbol}`, `/market`, `/market/winners`, `/market/losers`, `/market/breadth`,
+`/market/instruments`, `/crashes`, `/events`, `/gaps`, `/calendar`, `/metrics`,
+`/continuity`. Handlers read in-memory projections (database counts are refreshed by
+housekeeping), no endpoint exposes secrets, and nothing can place an order. Uvicorn runs as a
+supervised task under the observer's event loop: one process, no workers; an API failure
+degrades `api_agent` and never touches observation.
+
+## Scanner (tier 1) and observer (tier 2)
+
+The scanner subscribes to the whole enabled universe from Dhan's instrument master (MCX
+commodity futures, front month per commodity by default; NSE segments when configured)
+over its own feed connections partitioned within Dhan's documented limits, and keeps LTP /
+verified previous close / % change / day range / volume / OI per instrument. Today's winners
+and losers are ranked only from instruments with a VERIFIED previous close (Dhan's explicit
+previous-close data; otherwise `change_pct: null`, `reference_status: MISSING`) that are not
+stale, and only while the market is open. Breadth (advancers / decliners / unchanged / stale /
+unavailable, average and median move) is reported overall and per segment / category /
+instrument type; rankings are snapshotted to `market_rank_snapshots`. Only `SYMBOLS` receive
+the full closed-candle observer.
+
+## Discord as the operational surface
+
+Beyond setup cards, Discord receives every meaningful state change rendered from the event
+bus: startup / shutdown / deployed version, agent crash (`🚨 AUREON AGENT CRASH` with agent,
+state, safe error, crash id, restart count, recovery), restart and recovery, feed connected /
+disconnected / reconnecting / stalled / recovered, partial / silent / suspect minutes,
+verification started / succeeded / failed, live-vs-broker mismatch, gap detected / repaired,
+rollover stages, `MARKET OPEN` / `MARKET CLOSED` / session changes / holidays / approaching
+close, and a periodic `🏆 TODAY'S WINNERS` / `📉 TODAY'S LOSERS` digest with breadth. Repeats
+are deduplicated on the bus, bursts are batched, and the outbound rate is capped. Slash
+commands `/status`, `/crashes`, `/market`, `/winners`, `/losers`, `/agents`, `/symbol` are
+informational only.
+
+## Deployment (Docker + Jenkins)
+
+`Dockerfile`: python 3.12 slim, non-root user, `tini` for graceful SIGTERM, `EXPOSE 1250`,
+health check on `/api/v1/health`, persistent volumes `/data/sqlite`, `/data/parquet`,
+`/data/logs`; secrets are passed as environment variables at run time and never baked in.
+`Jenkinsfile` stages: Checkout → Resolve Git SHA → Python syntax / static sanity → Install
+dependencies → Run pytest → Build Docker image (`aureon-beast-india:${GIT_COMMIT}`) → Stop /
+replace previous container (previous image kept as `:rollback`) → Start new container
+(`aureon-beast-india`, `1250:1250`, host volumes under `/data/aureon`) → Health check (retry
+loop, fails the build) → Deployment notification (Discord webhook: `✅ Aureon deployed` with
+git / branch / tests / API / port / version, or `❌ Aureon deployment failed` with the stage).
+Dhan / Discord credentials come from Jenkins credentials, are masked in logs, and a missing
+Dhan credential refuses the deployment.
 
 ## Restart safety
 
@@ -265,9 +381,17 @@ deliberately not implemented; interfaces and the `model_registry` table exist (`
 * **Default branch.** GitHub's default branch must be switched to `main` in the repository
   settings (Repository Settings → Default branch → main); the code lives on `main` and the API
   used here cannot change it.
-* **MCX 2026 calendar** is populated from broker mirrors of the MCX holiday circular
-  (`verified_against_official_circular: false` until checked against mcxindia.com); the Diwali
-  Muhurat session is not entered because its timings were not published in those sources.
+* **MCX 2026 calendar** encodes the official MCX trading-holiday list (operator-verified,
+  `verified_against_official_circular: true`); the 08 Nov Diwali Muhurat session is a
+  `pending_special_sessions` entry (treated as closed) until MCX publishes its hours.
+* **Session-end candles.** `effective_close_time` and the recorded fixtures follow Dhan's
+  documented convention (last bar stamped at its open, spanning to the exchange close); a live
+  run should confirm it for the 23:00 H1 and 23:15 / 23:45 M15 bars.
+* **Scanner previous close** relies on Dhan's explicit previous-close packet for quote / full
+  subscriptions; if a live run shows it is not delivered for a segment, `change_pct` stays null
+  (never fabricated) until `previous_close_from_quote_day_close` is verified and enabled.
+* **Discord slash commands and outbound event embeds** are implemented against discord.py's
+  app-command tree but, like the card runtime, are not exercised against a live gateway in tests.
 * **Model training (§28)** is intentionally not implemented; only interfaces and the registry table exist.
 * The Discord runtime (gateway login, message send / edit) is not exercised in tests; the card,
   chart planner / renderer, coalescer and message-ref logic are.

@@ -49,9 +49,10 @@ class Database:
     def conn(self) -> sqlite3.Connection:
         return self._conn
 
-    def migrate(self) -> int:
+    def migrate(self, context: dict | None = None) -> int:
+        """Apply pending migrations; ``context`` (calendar, now) feeds data migrations."""
         with self._lock:
-            return apply_migrations(self._conn)
+            return apply_migrations(self._conn, context)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

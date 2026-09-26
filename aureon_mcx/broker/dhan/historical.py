@@ -31,8 +31,12 @@ class HistoricalProvider(Protocol):
 
 
 def normalize_intraday_response(payload: dict[str, Any], symbol: str, security_id: str, timeframe: Timeframe,
-                                expiry_date: str, now: datetime | None = None) -> list[Candle]:
-    """Convert Dhan's column-oriented intraday payload into closed Candles."""
+                                expiry_date: str, now: datetime | None = None, calendar: "SessionCalendar | None" = None) -> list[Candle]:
+    """Convert Dhan's column-oriented intraday payload into closed Candles.
+
+    A bar is closed when its EFFECTIVE close (nominal end capped at the exchange close for the
+    shortened last bar of the day, e.g. the 23:00 H1 closing at 23:30) is at or before `now`.
+    Without a calendar the nominal end is used (a session-capped bar then waits for its nominal end)."""
     now = ensure_utc(now or utc_now())
     required = ("open", "high", "low", "close", "timestamp")
     for k in required:
@@ -61,7 +65,8 @@ def normalize_intraday_response(payload: dict[str, Any], symbol: str, security_i
             open_interest=float(cols["open_interest"][i]) if i < len(cols["open_interest"]) and cols["open_interest"][i] not in (None, 0) else None,
             source="dhan", is_closed=True, expiry_date=expiry_date,
         )
-        if candle.close_time > now:
+        close_at = calendar.effective_close_time(open_time, timeframe.seconds) if calendar is not None else candle.close_time
+        if close_at > now:
             continue  # incomplete bar: never leaks into analysis
         out.append(candle)
     out.sort(key=lambda c: c.open_time)
@@ -69,10 +74,11 @@ def normalize_intraday_response(payload: dict[str, Any], symbol: str, security_i
 
 
 class DhanHistoricalProvider:
-    def __init__(self, http: DhanHttpClient, max_days_per_request: int = 5, now=utc_now):
+    def __init__(self, http: DhanHttpClient, max_days_per_request: int = 5, now=utc_now, calendar: "SessionCalendar | None" = None):
         self.http = http
         self.max_days = max_days_per_request
         self._now = now
+        self.calendar = calendar
 
     def fetch(self, symbol: str, security_id: str, exchange_segment: str, instrument_type: str, expiry_date: str,
               timeframe: Timeframe, start: datetime, end: datetime) -> list[Candle]:
@@ -102,7 +108,7 @@ class DhanHistoricalProvider:
                 raise
             if not isinstance(payload, dict):
                 raise DhanError(f"unexpected intraday payload type {type(payload).__name__}")
-            candles = normalize_intraday_response(payload, symbol, security_id, timeframe, expiry_date, now=self._now())
+            candles = normalize_intraday_response(payload, symbol, security_id, timeframe, expiry_date, now=self._now(), calendar=self.calendar)
             log.info("historical_fetch %s", kv(symbol=symbol, **ctx, bars=len(candles)))
             out.extend(candles)
             chunk_start = chunk_end
@@ -138,7 +144,8 @@ def verified_coverage(candles: list[Candle], timeframe: Timeframe, start: dateti
         t += step
     if not potential:
         return [(start, end)]  # nothing can ever exist here (holiday / closed hours)
-    expected = [t for t in potential if t + step <= now]
+    closed_at = (lambda t: calendar.effective_close_time(t, timeframe.seconds)) if calendar is not None else (lambda t: t + step)
+    expected = [t for t in potential if closed_at(t) <= now]
     if not expected:
         return []
     present = {ensure_utc(c.open_time) for c in candles if c.timeframe is timeframe}

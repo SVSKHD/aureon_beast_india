@@ -27,6 +27,13 @@ log = logging.getLogger("aureon.dhan.instruments")
 MCX_EXCHANGE = "MCX"
 SEGMENT_ALIASES: dict[str, set[str]] = {
     "MCX_COMM": {"M", "COMM", "MCX_COMM", "COMMODITY"},
+    "NSE_EQ": {"E", "EQ", "NSE_EQ", "EQUITY"},
+    "BSE_EQ": {"E", "EQ", "BSE_EQ", "EQUITY"},
+    "NSE_FNO": {"D", "FNO", "NSE_FNO", "DERIVATIVES"},
+    "BSE_FNO": {"D", "FNO", "BSE_FNO", "DERIVATIVES"},
+    "NSE_CURRENCY": {"C", "CURRENCY", "NSE_CURRENCY"},
+    "BSE_CURRENCY": {"C", "CURRENCY", "BSE_CURRENCY"},
+    "IDX_I": {"I", "INDEX", "IDX_I"},
 }
 OPTION_INSTRUMENT_TYPES = {"OPTFUT", "OPTCOM", "OPTIDX", "OPTSTK", "OPTCUR"}
 

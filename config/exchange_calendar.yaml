@@ -3,20 +3,23 @@
 # This file is the ONE source of truth for "is the exchange open", the trading-day end for a
 # given date, holidays, partial (session-wise) closures and special sessions. Every consumer
 # (aggregation expectations, H4 buckets, day frames, outcome horizons, stale detection,
-# health) asks SessionCalendar, which reads this file. Strategy session labels (ASIA / LONDON
-# / NEW_YORK / MORNING / EVENING) stay in sessions.yaml.
+# health, market state, Discord) asks SessionCalendar, which reads this file. Strategy
+# session labels (ASIA / LONDON / NEW_YORK / MORNING / EVENING) stay in sessions.yaml.
 #
-# SOURCE: MCX circular "Trading Holidays for the Calendar Year 2026" and MCX circular
-# 068/2026 (revision of trading hours from 09-Mar-2026 for US daylight saving), as
-# republished by broker mirrors (ICICI Direct, Groww, Kotak Neo, Upstox, Jainam,
-# ismarketopen.in, Bajaj Broking). mcxindia.com was not reachable from the build environment,
-# so `verified_against_official_circular` is false: cross-check against the official
-# circulars before relying on this file for a new calendar year. Nothing here is invented;
-# entries whose exact timing MCX has not yet published are marked closed (fail closed).
+# SOURCE: MCX "Trading Holidays for the Calendar Year 2026" (official trading-holiday list,
+# operator-verified on 2026-09-26) and MCX circular 068/2026 (revised trading hours from
+# 09-Mar-2026 for US daylight saving). Only the official list is encoded: dates that are
+# closed merely because they fall on a weekend are NOT listed (weekend closure covers them).
+# Nothing here is invented; a session whose exact timing MCX has not yet published is marked
+# pending and treated as CLOSED (fail closed) until the timing is entered.
+#
+# Multi-year support: additional years live in exchange_calendar_<YEAR>.yaml (or calendars/*.yaml).
+# A trading date outside every configured year is CALENDAR_OUT_OF_RANGE: the service refuses
+# to assume normal trading (startup aborts, live mode fails closed).
 exchange: MCX
 segment: commodity_derivatives_non_agri
 year: 2026
-verified_against_official_circular: false
+verified_against_official_circular: true
 
 # Normal trading day for non-agri contracts (GOLD, SILVER, ...).
 default_session:
@@ -38,27 +41,29 @@ close_periods:
 #         morning  -> morning session closed, trading starts at evening_start (17:00)
 #         evening  -> evening session closed, trading ends at evening_start (17:00)
 holidays:
+  - { date: "2026-01-01", name: "New Year Day", closed: evening, note: "morning session 09:00-17:00 only" }
   - { date: "2026-01-26", name: "Republic Day", closed: full }
-  - { date: "2026-02-15", name: "Mahashivratri", closed: full, note: "Sunday" }
   - { date: "2026-03-03", name: "Holi", closed: morning }
-  - { date: "2026-03-21", name: "Id-Ul-Fitr (Ramzan Id)", closed: full, note: "Saturday" }
-  - { date: "2026-03-26", name: "Shri Ram Navami", closed: morning }
+  - { date: "2026-03-26", name: "Shri Ram Navmi", closed: morning }
   - { date: "2026-03-31", name: "Shri Mahavir Jayanti", closed: morning }
   - { date: "2026-04-03", name: "Good Friday", closed: full }
   - { date: "2026-04-14", name: "Dr. Baba Saheb Ambedkar Jayanti", closed: morning }
   - { date: "2026-05-01", name: "Maharashtra Day", closed: morning }
   - { date: "2026-05-28", name: "Bakri Id", closed: morning }
-  - { date: "2026-06-26", name: "Muharram", closed: morning }
-  - { date: "2026-08-15", name: "Independence Day", closed: full, note: "Saturday" }
+  - { date: "2026-06-26", name: "Moharram", closed: morning }
   - { date: "2026-09-14", name: "Ganesh Chaturthi", closed: morning }
   - { date: "2026-10-02", name: "Mahatma Gandhi Jayanti", closed: full }
-  - { date: "2026-10-20", name: "Dussehra", closed: morning }
-  - { date: "2026-11-08", name: "Diwali Laxmi Pujan", closed: full,
-      note: "Sunday. MCX will hold a Muhurat trading session; timings not yet notified - add a special_sessions entry once published" }
-  - { date: "2026-11-10", name: "Diwali Balipratipada", closed: morning }
+  - { date: "2026-10-20", name: "Dassera", closed: morning }
+  - { date: "2026-11-10", name: "Diwali-Balipratipada", closed: morning }
   - { date: "2026-11-24", name: "Guru Nanak Jayanti", closed: morning }
   - { date: "2026-12-25", name: "Christmas", closed: full }
 
-# Date-specific sessions that replace the normal day entirely (e.g. Muhurat trading).
+# Date-specific sessions that replace the normal day entirely (e.g. Muhurat trading). An
+# entry here overrides weekend / holiday closure for that date.
 special_sessions: []
-#  - { date: "2026-11-08", start: "18:00", end: "19:00", note: "Muhurat trading (example only)" }
+
+# Announced special sessions whose official timings are NOT yet published. The date stays
+# CLOSED (reason SPECIAL_SESSION_PENDING) until it is moved into special_sessions with its
+# start / end. Never guess the hours.
+pending_special_sessions:
+  - { date: "2026-11-08", name: "Diwali Muhurat trading", note: "Sunday; MCX announced Muhurat trading, timings not yet notified" }

@@ -926,6 +926,123 @@ class MarketDataGapRepository:
         return self.db.query("SELECT * FROM market_data_gaps WHERE resolved_at IS NULL AND security_id = ? ORDER BY bucket_open_time", (security_id,))
 
 
+# --------------------------------------------------------- runtime resilience
+class ContinuityIncidentRepository:
+    """Unresolved market-data incidents (pending minutes, gaps) that must survive a restart."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def upsert(self, rec: dict[str, Any]) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO continuity_incidents(symbol, security_id, kind, timeframe, open_time, reason, state, first_detected_at,
+                       last_attempt_at, next_retry_at, attempt_count, last_error, resolved_at, resolution)
+                   VALUES (:symbol, :security_id, :kind, :timeframe, :open_time, :reason, :state, :first_detected_at, :last_attempt_at,
+                       :next_retry_at, :attempt_count, :last_error, :resolved_at, :resolution)
+                   ON CONFLICT(security_id, kind, timeframe, open_time) DO UPDATE SET state = excluded.state,
+                       last_attempt_at = excluded.last_attempt_at, next_retry_at = excluded.next_retry_at,
+                       attempt_count = excluded.attempt_count, last_error = excluded.last_error, resolved_at = excluded.resolved_at,
+                       resolution = excluded.resolution, reason = excluded.reason""",
+                rec,
+            )
+
+    def open(self, security_id: str | None = None) -> list[sqlite3.Row]:
+        if security_id is None:
+            return self.db.query("SELECT * FROM continuity_incidents WHERE state = 'OPEN' ORDER BY open_time")
+        return self.db.query("SELECT * FROM continuity_incidents WHERE state = 'OPEN' AND security_id = ? ORDER BY open_time", (security_id,))
+
+    def recent(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.db.query("SELECT * FROM continuity_incidents ORDER BY id DESC LIMIT ?", (limit,))
+
+
+class CrashReportRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def insert(self, rec: dict[str, Any]) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO crash_reports(crash_id, timestamp, component, agent, task, exception_class, message, stack_trace, symbol,
+                       security_id, app_version, git_sha, process_uptime_s, restart_number, recovery_result, resolved_at)
+                   VALUES (:crash_id, :timestamp, :component, :agent, :task, :exception_class, :message, :stack_trace, :symbol,
+                       :security_id, :app_version, :git_sha, :process_uptime_s, :restart_number, :recovery_result, :resolved_at)""",
+                rec,
+            )
+
+    def set_result(self, crash_id: str, recovery_result: str, resolved_at: datetime | None) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE crash_reports SET recovery_result = ?, resolved_at = ? WHERE crash_id = ?",
+                         (recovery_result, to_db(resolved_at), crash_id))
+
+    def recent(self, limit: int = 50, agent: str | None = None, resolved: bool | None = None) -> list[sqlite3.Row]:
+        where, params = [], []
+        if agent is not None:
+            where.append("agent = ?")
+            params.append(agent)
+        if resolved is True:
+            where.append("resolved_at IS NOT NULL")
+        elif resolved is False:
+            where.append("resolved_at IS NULL")
+        sql = "SELECT * FROM crash_reports" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?"
+        return self.db.query(sql, (*params, limit))
+
+    def unresolved_count(self) -> int:
+        return int(self.db.query_one("SELECT COUNT(*) AS n FROM crash_reports WHERE resolved_at IS NULL")["n"])
+
+    def count_since(self, since: datetime) -> int:
+        return int(self.db.query_one("SELECT COUNT(*) AS n FROM crash_reports WHERE timestamp >= ?", (to_db(since),))["n"])
+
+
+class SystemEventRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def insert(self, rec: dict[str, Any]) -> int:
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO system_events(event_type, severity, dedupe_key, agent, symbol, security_id, message, payload_json, created_at)
+                   VALUES (:event_type, :severity, :dedupe_key, :agent, :symbol, :security_id, :message, :payload_json, :created_at)""",
+                rec,
+            )
+            return int(cur.lastrowid)
+
+    def recent(self, limit: int = 100, event_type: str | None = None) -> list[sqlite3.Row]:
+        if event_type is None:
+            return self.db.query("SELECT * FROM system_events ORDER BY id DESC LIMIT ?", (limit,))
+        return self.db.query("SELECT * FROM system_events WHERE event_type = ? ORDER BY id DESC LIMIT ?", (event_type, limit))
+
+
+class RankSnapshotRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def insert_many(self, snapshot_at: datetime, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        with self.db.transaction() as conn:
+            conn.executemany(
+                """INSERT OR IGNORE INTO market_rank_snapshots(snapshot_at, segment, category, security_id, symbol, display_symbol, rank, ltp,
+                       previous_close, change, change_pct, volume, open_interest)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(to_db(snapshot_at), r["segment"], r.get("category"), r["security_id"], r["symbol"], r["display_symbol"], r["rank"],
+                  r.get("ltp"), r.get("previous_close"), r.get("change"), r.get("change_pct"), r.get("volume"), r.get("open_interest"))
+                 for r in rows],
+            )
+        return len(rows)
+
+    def latest(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.db.query("SELECT * FROM market_rank_snapshots ORDER BY id DESC LIMIT ?", (limit,))
+
+
+class MigrationLogRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def all(self) -> list[sqlite3.Row]:
+        return self.db.query("SELECT * FROM migration_log ORDER BY id")
+
+
 # ----------------------------------------------------------------- aggregate
 class Repositories:
     """Convenience bundle of all repositories over one Database."""
@@ -948,3 +1065,8 @@ class Repositories:
         self.message_refs = MessageRefRepository(db)
         self.monitors = MonitorSubscriptionRepository(db)
         self.gaps = MarketDataGapRepository(db)
+        self.incidents = ContinuityIncidentRepository(db)
+        self.crashes = CrashReportRepository(db)
+        self.events = SystemEventRepository(db)
+        self.rank_snapshots = RankSnapshotRepository(db)
+        self.migration_log = MigrationLogRepository(db)

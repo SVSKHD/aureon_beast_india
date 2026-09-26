@@ -63,6 +63,16 @@ historical:
   # minute unless this is true (Dhan gives no such guarantee). Default false: fail closed.
   allow_verified_zero_trade_fill: false
   verification_retries: 3
+  # Persistent retry schedule for unresolved minutes / gaps (seconds; last value repeats).
+  verification_backoff_seconds: [2, 5, 10, 20, 30, 60]
+  degraded_after_seconds: 120
+  error_after_seconds: 900
+  # No packet on a connected socket for this long -> feed STALLED: open minute is SUSPECT.
+  feed_stall_seconds: 15
+  # Research validation: compare every trusted live M1 with the broker's M1 after a delay.
+  reconcile_every_live_m1: false
+  reconcile_delay_seconds: 20
+  reconcile_volume_tolerance: 0.2
 
 discord:
   debounce_seconds: 5.0

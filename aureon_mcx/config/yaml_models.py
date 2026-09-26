@@ -281,6 +281,22 @@ class CalendarSpecialSession(StrictModel):
         return self
 
 
+class CalendarPendingSession(StrictModel):
+    """A special session MCX announced without publishing its hours: the date stays CLOSED."""
+
+    date: str
+    name: str
+    note: str = ""
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+
 class ExchangeCalendarConfig(StrictModel):
     """`config/exchange_calendar.yaml`: the authoritative exchange calendar (fails loudly if malformed)."""
 
@@ -293,6 +309,7 @@ class ExchangeCalendarConfig(StrictModel):
     close_periods: list[ClosePeriod] = Field(default_factory=list)
     holidays: list[CalendarHoliday] = Field(default_factory=list)
     special_sessions: list[CalendarSpecialSession] = Field(default_factory=list)
+    pending_special_sessions: list[CalendarPendingSession] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _consistent(self) -> "ExchangeCalendarConfig":
@@ -302,6 +319,10 @@ class ExchangeCalendarConfig(StrictModel):
         specials = [x.date for x in self.special_sessions]
         if len(specials) != len(set(specials)):
             raise ValueError("exchange calendar: duplicate special session dates")
+        pending = [x.date for x in self.pending_special_sessions]
+        if set(pending) & set(specials):
+            raise ValueError("exchange calendar: a date cannot be both a special session and pending timings")
+        specials = specials + pending
         periods = sorted(self.close_periods, key=lambda p: p.from_date)
         for a, b in zip(periods, periods[1:]):
             if b.from_date <= a.to_date:
@@ -333,6 +354,16 @@ class SessionsConfig(StrictModel):
     # Authoritative exchange calendar (config/exchange_calendar.yaml); the loader requires the
     # file. None only for unit tests that build a SessionsConfig by hand (weekday defaults apply).
     calendar: ExchangeCalendarConfig | None = None
+    # Every configured calendar year (exchange_calendar.yaml, exchange_calendar_<YEAR>.yaml,
+    # calendars/*.yaml). Dates outside these years are CALENDAR_OUT_OF_RANGE (fail closed).
+    calendars: dict[int, ExchangeCalendarConfig] = Field(default_factory=dict)
+
+    @property
+    def calendar_years(self) -> list[int]:
+        years = set(self.calendars)
+        if self.calendar is not None and self.calendar.year is not None:
+            years.add(self.calendar.year)
+        return sorted(years)
 
     @field_validator("timezone")
     @classmethod
@@ -459,8 +490,32 @@ class HistoricalSpec(StrictModel):
     # guarantee, so the safe default is False: the minute stays unresolved and the symbol
     # untrusted until the broker returns it.
     allow_verified_zero_trade_fill: bool = False
-    # Bounded retries for broker M1 verification / recovery before the symbol is marked ERROR.
+    # Fetch attempts inside ONE recovery / verification call (transport failures).
     verification_retries: int = Field(default=3, ge=1)
+    # Persistent retry schedule (seconds) for unresolved minutes / gaps: after the last value
+    # the interval stays constant. Retrying continues while the market is open and the minute
+    # belongs to the current trading day; nothing is ever busy-looped.
+    verification_backoff_seconds: list[float] = Field(default_factory=lambda: [2.0, 5.0, 10.0, 20.0, 30.0, 60.0])
+    # Symbol state while an incident stays unresolved: RECOVERING_GAP until degraded_after,
+    # DEGRADED until error_after, then ERROR (retries continue in every state).
+    degraded_after_seconds: float = Field(default=120.0, ge=0)
+    error_after_seconds: float = Field(default=900.0, ge=0)
+    # A connected socket that delivers no packet at all for this long is a STALLED feed: the
+    # open minute becomes SUSPECT and is replaced by the broker's M1 (never trusted locally).
+    feed_stall_seconds: float = Field(default=15.0, gt=0)
+    # Research-validation mode: every trusted live M1 is compared with the broker's M1
+    # `reconcile_delay_seconds` after it closes; mismatches are counted, reported and, when the
+    # primary bucket is still open, the broker bar replaces the local one.
+    reconcile_every_live_m1: bool = False
+    reconcile_delay_seconds: float = Field(default=20.0, ge=0)
+    reconcile_volume_tolerance: float = Field(default=0.2, ge=0)
+
+    @field_validator("verification_backoff_seconds")
+    @classmethod
+    def _backoff(cls, v: list[float]) -> list[float]:
+        if not v or any(x <= 0 for x in v):
+            raise ValueError("verification_backoff_seconds must be a non-empty list of positive seconds")
+        return v
 
 
 class DiscordSpec(StrictModel):
@@ -485,3 +540,40 @@ class AnalysisConfig(StrictModel):
     historical: HistoricalSpec = HistoricalSpec()
     discord: DiscordSpec = DiscordSpec()
     execution: ExecutionSpec = ExecutionSpec()
+
+
+# ---------------------------------------------------------------- scanner.yaml
+class ScannerConfig(StrictModel):
+    """Broad-market scanner (tier 1): every enabled instrument gets LTP / previous close /
+    % change / breadth; only the configured logical symbols get the deep observer (tier 2)."""
+
+    enabled: bool = True
+    segments: list[str] = Field(default_factory=lambda: ["MCX_COMM"])
+    instrument_types: list[str] = Field(default_factory=lambda: ["FUTCOM"])
+    include: list[str] = Field(default_factory=lambda: ["*"])   # base-name globs
+    exclude: list[str] = Field(default_factory=list)
+    # one contract per base name (nearest non-expired expiry): the liquid front month
+    nearest_expiry_only: bool = True
+    # Dhan v2 live feed: up to 100 instruments per subscription request and (documented) up to
+    # 5000 instruments per WebSocket connection; the deep observer uses one more connection.
+    max_subscriptions_per_connection: int = Field(default=5000, ge=1, le=5000)
+    max_connections: int = Field(default=2, ge=1, le=4)
+    feed_mode: Literal["ticker", "quote", "full"] = "quote"
+    winners_limit: int = Field(default=20, ge=1, le=100)
+    losers_limit: int = Field(default=20, ge=1, le=100)
+    stale_after_seconds: float = Field(default=300.0, gt=0)
+    snapshot_interval_seconds: float = Field(default=900.0, ge=0)   # 0 disables market_rank_snapshots
+    digest_interval_seconds: float = Field(default=900.0, ge=60)
+    # The verified previous close comes from Dhan's explicit "previous close" packet. Only enable
+    # this after confirming on a live run that the quote packet's day-close field carries the
+    # previous session close for the segment; otherwise the reference stays MISSING (no fake %).
+    previous_close_from_quote_day_close: bool = False
+    category_map: dict[str, str] = Field(default_factory=dict)   # base name -> logical category (bullion, energy, ...)
+
+    @field_validator("segments", "instrument_types")
+    @classmethod
+    def _upper(cls, v: list[str]) -> list[str]:
+        out = [x.strip().upper() for x in v if x.strip()]
+        if not out:
+            raise ValueError("must not be empty")
+        return out

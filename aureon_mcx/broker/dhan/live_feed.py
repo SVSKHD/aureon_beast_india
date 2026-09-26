@@ -35,7 +35,9 @@ from typing import Awaitable, Callable, Protocol
 
 from aureon_mcx.logging_setup import kv
 from aureon_mcx.market.candle_builder import Tick
-from aureon_mcx.market.timeutil import from_epoch
+from datetime import datetime
+
+from aureon_mcx.market.timeutil import from_epoch, utc_now
 
 log = logging.getLogger("aureon.dhan.live")
 
@@ -171,12 +173,20 @@ class DhanLiveFeedProvider:
     def __init__(self, client_id: str, access_token: str, exchange_segment: str, on_tick: Callable[[Tick], None],
                  on_status: Callable[[str, dict], None] | None = None, mode: str = "quote", url: str = DHAN_FEED_URL,
                  backoff: tuple[float, ...] = (1, 2, 4, 8, 16, 30), ping_interval: float = 20.0,
-                 connector: Callable[[str], Awaitable] | None = None):
+                 connector: Callable[[str], Awaitable] | None = None, on_packet: Callable[[FeedPacket], None] | None = None,
+                 closed_backoff: float | None = None, is_market_open: Callable[[], bool] | None = None, now=utc_now):
         self._client_id = client_id
         self._token = access_token
         self.exchange_segment = exchange_segment
         self.on_tick = on_tick
+        self.on_packet = on_packet
         self.on_status = on_status or (lambda *_: None)
+        self._now = now
+        # outside market hours a dropped socket is normal: reconnect slowly instead of hammering the gateway
+        self.closed_backoff = closed_backoff
+        self.is_market_open = is_market_open
+        self.last_packet_at: datetime | None = None
+        self.packets_rejected = 0
         self.mode = mode
         self.url = url
         self.backoff = backoff
@@ -260,6 +270,8 @@ class DhanLiveFeedProvider:
             if stop.is_set():
                 break
             delay = self.backoff[min(attempt, len(self.backoff) - 1)]
+            if self.closed_backoff is not None and self.is_market_open is not None and not self.is_market_open():
+                delay = max(delay, self.closed_backoff)
             attempt += 1
             self.reconnects += 1
             self.on_status("reconnecting", {"delay": delay, "attempt": attempt})
@@ -281,9 +293,13 @@ class DhanLiveFeedProvider:
             self.handle_binary(data)
 
     def handle_binary(self, data: bytes) -> Tick | None:
+        self.last_packet_at = self._now()
         p = parse_packet(data)
         if p is None:
+            self.packets_rejected += 1
             return None
+        if self.on_packet is not None:
+            self.on_packet(p)
         if p.code == CODE_DISCONNECT:
             log.warning("feed_disconnect_packet %s", kv(reason=p.disconnect_reason))
             raise ConnectionError(f"feed disconnect reason={p.disconnect_reason}")

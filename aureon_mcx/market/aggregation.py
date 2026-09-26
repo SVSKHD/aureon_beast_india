@@ -189,6 +189,18 @@ class TimeframeAggregator:
                     self._gap_buckets.pop(k, None)
         return res
 
+    def replace_constituent(self, candle: Candle) -> bool:
+        """Replace an expected constituent of the OPEN bucket with the broker's exact bar (reconcile
+        mode). A bucket that already closed is never rewritten; returns False in that case."""
+        b = self._bucket
+        if b is None or candle.timeframe != self.source or not candle.is_closed:
+            return False
+        ts = ensure_utc(candle.open_time)
+        if ts not in b.expected or ts not in b.constituents:
+            return False
+        b.constituents[ts] = candle
+        return True
+
     def try_complete_gap(self, candle: Candle) -> Candle | None:
         """A late (broker-verified) constituent for a bucket already emitted as GAP: add it and,
         once every expected constituent is present, return the rebuilt COMPLETE bar so the

@@ -9,6 +9,7 @@ Feature snapshots are immutable: an UPDATE trigger aborts any modification.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Callable
@@ -388,11 +389,121 @@ ALTER TABLE session_state_v3 RENAME TO session_state;
 CREATE INDEX IF NOT EXISTS ix_session_state_lookup ON session_state(symbol, security_id, session_date);
 """,
     ),
+    (
+        4,
+        """
+-- Legacy historical cache metadata (rows written under the old "requested range = cached"
+-- semantics) is rebuilt by _rebuild_cache_coverage() BEFORE this SQL from the candles that
+-- are actually stored (see migration_log for the metrics). Candle rows are never touched.
+CREATE TABLE IF NOT EXISTS migration_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    version         INTEGER NOT NULL,
+    step            TEXT NOT NULL,
+    metrics_json    TEXT NOT NULL,
+    applied_at      TEXT NOT NULL
+);
+""",
+    ),
+    (
+        5,
+        """
+-- Runtime resilience tables: unresolved market-data incidents survive restarts, crashes are
+-- durable, important system events are queryable, and scanner rankings can be studied later.
+CREATE TABLE IF NOT EXISTS continuity_incidents (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT NOT NULL,
+    security_id         TEXT NOT NULL,
+    kind                TEXT NOT NULL,              -- pending_minute | gap
+    timeframe           TEXT NOT NULL,
+    open_time           TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    state               TEXT NOT NULL,              -- OPEN | RESOLVED | ABANDONED
+    first_detected_at   TEXT NOT NULL,
+    last_attempt_at     TEXT,
+    next_retry_at       TEXT,
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    resolved_at         TEXT,
+    resolution          TEXT,
+    UNIQUE(security_id, kind, timeframe, open_time)
+);
+CREATE INDEX IF NOT EXISTS ix_continuity_incidents_open ON continuity_incidents(state, security_id);
+
+CREATE TABLE IF NOT EXISTS crash_reports (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    crash_id            TEXT NOT NULL UNIQUE,
+    timestamp           TEXT NOT NULL,
+    component           TEXT NOT NULL,
+    agent               TEXT,
+    task                TEXT,
+    exception_class     TEXT NOT NULL,
+    message             TEXT NOT NULL,
+    stack_trace         TEXT NOT NULL,
+    symbol              TEXT,
+    security_id         TEXT,
+    app_version         TEXT NOT NULL,
+    git_sha             TEXT,
+    process_uptime_s    REAL NOT NULL,
+    restart_number      INTEGER NOT NULL DEFAULT 0,
+    recovery_result     TEXT NOT NULL DEFAULT 'pending',
+    resolved_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_crash_reports_ts ON crash_reports(timestamp);
+
+CREATE TABLE IF NOT EXISTS system_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type      TEXT NOT NULL,
+    severity        TEXT NOT NULL,
+    dedupe_key      TEXT,
+    agent           TEXT,
+    symbol          TEXT,
+    security_id     TEXT,
+    message         TEXT NOT NULL,
+    payload_json    TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_system_events_created ON system_events(created_at);
+
+CREATE TABLE IF NOT EXISTS market_rank_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_at     TEXT NOT NULL,
+    segment         TEXT NOT NULL,
+    category        TEXT,
+    security_id     TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    display_symbol  TEXT NOT NULL,
+    rank            INTEGER NOT NULL,
+    ltp             REAL,
+    previous_close  REAL,
+    change          REAL,
+    change_pct      REAL,
+    volume          REAL,
+    open_interest   REAL,
+    UNIQUE(snapshot_at, security_id)
+);
+CREATE INDEX IF NOT EXISTS ix_rank_snapshots_at ON market_rank_snapshots(snapshot_at);
+""",
+    ),
 ]
 
 # Python-side steps that must run BEFORE a version's SQL (data consolidation that
 # needs judgement SQL cannot express safely).
-PRE_STEPS: dict[int, "Callable[[sqlite3.Connection], None]"] = {}
+PRE_STEPS: dict[int, "Callable[[sqlite3.Connection, dict], None]"] = {}
+
+
+def _ensure_migration_log(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS migration_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER NOT NULL, step TEXT NOT NULL,
+               metrics_json TEXT NOT NULL, applied_at TEXT NOT NULL)"""
+    )
+
+
+def log_migration_step(conn: sqlite3.Connection, version: int, step: str, metrics: dict) -> None:
+    """Durable record of what a data migration actually did (audited by tools.audit_database)."""
+    _ensure_migration_log(conn)
+    conn.execute("INSERT INTO migration_log(version, step, metrics_json, applied_at) VALUES (?,?,?,?)",
+                 (version, step, json.dumps(metrics, default=str), datetime.now(tz=timezone.utc).isoformat()))
 
 
 class MigrationError(RuntimeError):
@@ -402,7 +513,7 @@ class MigrationError(RuntimeError):
 _TERMINAL = ("COMPLETED", "INVALIDATED")
 
 
-def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
+def _consolidate_duplicate_setups(conn: sqlite3.Connection, context: dict | None = None) -> None:
     """v2: one setup per origin detection, without destroying lifecycle state.
 
     Canonical choice per origin_detection_id, in order: a terminal-state row (the
@@ -417,6 +528,7 @@ def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
         "SELECT origin_detection_id FROM setups GROUP BY origin_detection_id HAVING COUNT(*) > 1"
     ).fetchall()
     ambiguous: list[str] = []
+    metrics = {"duplicate_groups": len(groups), "setups_removed": 0, "events_repointed": 0, "clearances_repointed": 0}
     for (origin_id,) in [tuple(g) for g in groups]:
         rows = conn.execute(
             """SELECT s.id, s.state, s.updated_open_time, s.closed_at,
@@ -438,7 +550,8 @@ def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
         losers = [int(r["id"]) for r in rows if int(r["id"]) != canonical]
         marks = ",".join("?" for _ in losers)
         # lifecycle events: move, then drop exact duplicates (keep the oldest per transition)
-        conn.execute(f"UPDATE setup_events SET setup_id = ? WHERE setup_id IN ({marks})", (canonical, *losers))
+        metrics["events_repointed"] += conn.execute(f"UPDATE setup_events SET setup_id = ? WHERE setup_id IN ({marks})",
+                                                    (canonical, *losers)).rowcount
         conn.execute(
             """DELETE FROM setup_events WHERE setup_id = ? AND id NOT IN (
                    SELECT MIN(id) FROM setup_events WHERE setup_id = ? GROUP BY candle_id, to_state)""",
@@ -450,7 +563,8 @@ def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
                     SELECT candle_id FROM clearances WHERE setup_id = ?)""",
             (*losers, canonical),
         )
-        conn.execute(f"UPDATE clearances SET setup_id = ? WHERE setup_id IN ({marks})", (canonical, *losers))
+        metrics["clearances_repointed"] += conn.execute(f"UPDATE clearances SET setup_id = ? WHERE setup_id IN ({marks})",
+                                                        (canonical, *losers)).rowcount
         conn.execute(
             """DELETE FROM clearances WHERE setup_id = ? AND id NOT IN (
                    SELECT MIN(id) FROM clearances WHERE setup_id = ? GROUP BY candle_id)""",
@@ -465,17 +579,79 @@ def _consolidate_duplicate_setups(conn: sqlite3.Connection) -> None:
             if newest is not None:
                 conn.execute("UPDATE discord_message_refs SET setup_id = ? WHERE id = ?", (canonical, int(newest["id"])))
         conn.execute(f"DELETE FROM discord_message_refs WHERE setup_id IN ({marks})", losers)
-        conn.execute(f"DELETE FROM setups WHERE id IN ({marks})", losers)
+        metrics["setups_removed"] += conn.execute(f"DELETE FROM setups WHERE id IN ({marks})", losers).rowcount
     if ambiguous:
         raise MigrationError("cannot consolidate duplicate setups (tied candidates disagree on state); "
                              "resolve manually before migrating:\n  " + "\n  ".join(ambiguous))
     # transitions that are still duplicated inside a single setup (v1 replays): keep the oldest
-    conn.execute(
+    metrics["duplicate_events_removed"] = conn.execute(
         "DELETE FROM setup_events WHERE id NOT IN (SELECT MIN(id) FROM setup_events GROUP BY setup_id, candle_id, to_state)"
-    )
+    ).rowcount
+    # A migration_log row for version 2 is the proof that the SAFE consolidation ran; a DB
+    # migrated by the old blind DELETE has no such row (tools.audit_database reports it).
+    log_migration_step(conn, 2, "consolidate_duplicate_setups", metrics)
 
 
 PRE_STEPS[2] = _consolidate_duplicate_setups
+
+
+def _rebuild_cache_coverage(conn: sqlite3.Connection, context: dict | None = None) -> None:
+    """v4: rebuild historical_cache_ranges from the candles actually stored.
+
+    Rows written before PR #3 meant "this range was REQUESTED"; a partial or empty broker
+    response still suppressed later downloads. Every legacy row is replaced by the coverage
+    that the stored candles prove (calendar-expected bars all present), computed with the
+    same ``verified_coverage`` rule the live cache uses. Candle rows are never modified.
+    Without a SessionCalendar in ``context`` nothing can be verified, so the metadata is
+    cleared and rebuilt lazily by the next download (safer than trusting it).
+    """
+    from aureon_mcx.broker.dhan.historical import verified_coverage  # local import: avoids storage <-> broker cycle
+    from aureon_mcx.market.timeframe import Timeframe
+    from aureon_mcx.market.timeutil import from_db, to_db, utc_now
+    from aureon_mcx.storage.repositories import merge_intervals, _row_to_candle
+
+    ctx = context or {}
+    calendar = ctx.get("calendar")
+    now = ctx.get("now") or utc_now()
+    rows = conn.execute("SELECT * FROM historical_cache_ranges ORDER BY security_id, timeframe, range_start").fetchall()
+    metrics = {"legacy_cache_ranges_seen": len(rows), "verified_ranges_written": 0, "invalid_ranges_removed": 0,
+               "calendar_available": calendar is not None}
+    conn.execute("DELETE FROM historical_cache_ranges")
+    if calendar is None:
+        metrics["invalid_ranges_removed"] = len(rows)
+        metrics["note"] = "no calendar available: cache metadata cleared, rebuilt by the next download"
+        log_migration_step(conn, 4, "rebuild_cache_coverage", metrics)
+        return
+    by_key: dict[tuple[str, str], list[tuple]] = {}
+    for r in rows:
+        by_key.setdefault((r["security_id"], r["timeframe"]), []).append((from_db(r["range_start"]), from_db(r["range_end"])))
+    for (security_id, tf_value), ranges in by_key.items():
+        try:
+            tf = Timeframe(tf_value)
+        except ValueError:
+            metrics["invalid_ranges_removed"] += len(ranges)
+            continue
+        verified: list[tuple] = []
+        for start, end in merge_intervals(ranges):
+            candles = [_row_to_candle(c) for c in conn.execute(
+                "SELECT * FROM candles WHERE security_id = ? AND timeframe = ? AND open_time >= ? AND open_time < ? ORDER BY open_time",
+                (security_id, tf_value, to_db(start), to_db(end))).fetchall()]
+            verified += verified_coverage(candles, tf, start, end, calendar=calendar, now=now)
+        merged = merge_intervals(verified)
+        for s_, e_ in merged:
+            bars = conn.execute(
+                "SELECT COUNT(*) FROM candles WHERE security_id = ? AND timeframe = ? AND open_time >= ? AND open_time < ?",
+                (security_id, tf_value, to_db(s_), to_db(e_))).fetchone()[0]
+            conn.execute(
+                """INSERT INTO historical_cache_ranges(security_id, timeframe, range_start, range_end, bars, downloaded_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (security_id, tf_value, to_db(s_), to_db(e_), int(bars), to_db(now)))
+        metrics["verified_ranges_written"] += len(merged)
+        metrics["invalid_ranges_removed"] += max(0, len(ranges) - len(merged)) if merged else len(ranges)
+    log_migration_step(conn, 4, "rebuild_cache_coverage", metrics)
+
+
+PRE_STEPS[4] = _rebuild_cache_coverage
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -490,7 +666,9 @@ def current_version(conn: sqlite3.Connection) -> int:
     return int(v or 0)
 
 
-def apply_migrations(conn: sqlite3.Connection) -> int:
+def apply_migrations(conn: sqlite3.Connection, context: dict | None = None) -> int:
+    """Apply pending migrations. ``context`` may carry {"calendar": SessionCalendar, "now": datetime}
+    for data migrations that need exchange-calendar judgement (v4 cache rebuild)."""
     version = current_version(conn)
     for target, sql in MIGRATIONS:
         if target <= version:
@@ -499,7 +677,7 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
         try:
             pre = PRE_STEPS.get(target)
             if pre is not None:
-                pre(conn)
+                pre(conn, context or {})
             _exec_script(conn, sql)
             conn.execute(
                 "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",

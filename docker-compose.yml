@@ -1,0 +1,25 @@
+# Local / single-host run of the Aureon observer with persistent research data.
+# Secrets come from the environment (or an untracked .env file); nothing is baked into the image.
+services:
+  aureon:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    image: aureon-beast-india:${GIT_SHA:-local}
+    container_name: aureon-beast-india
+    restart: unless-stopped
+    ports:
+      - "1250:1250"
+    environment:
+      DHAN_CLIENT_ID: ${DHAN_CLIENT_ID}
+      DHAN_ACCESS_TOKEN: ${DHAN_ACCESS_TOKEN}
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+      AUREON_GIT_SHA: ${GIT_SHA:-unknown}
+      AUREON_API_PORT: "1250"
+    volumes:
+      - /data/aureon/sqlite:/data/sqlite
+      - /data/aureon/parquet:/data/parquet
+      - /data/aureon/logs:/data/logs
+    stop_grace_period: 30s

@@ -1,0 +1,44 @@
+# Aureon MCX - broad-market scanner (tier 1). MCX instruments are commodity contracts, not equities.
+# Every enabled instrument in the configured segments is scanned for LTP / previous close /
+# % change / breadth; only SYMBOLS (GOLD, SILVER) get the deep observer (tier 2).
+scanner:
+  enabled: true
+  segments: [MCX_COMM]          # NSE_EQ etc. can be added later when configured
+  instrument_types: [FUTCOM]
+  include: ["*"]                # base-name globs, e.g. ["GOLD*", "SILVER*", "CRUDEOIL"]
+  exclude: []
+  nearest_expiry_only: true     # one contract per commodity (front month)
+  max_subscriptions_per_connection: 5000   # Dhan v2 documented limit per WebSocket (100 per request)
+  max_connections: 2
+  feed_mode: quote
+  winners_limit: 20
+  losers_limit: 20
+  stale_after_seconds: 300      # no packet for this long -> stale: excluded from winners / losers
+  snapshot_interval_seconds: 900   # market_rank_snapshots cadence (0 disables)
+  digest_interval_seconds: 900     # Discord leaderboard digest cadence
+  # Previous close reference: Dhan's explicit previous-close packet only (verified). Enable the
+  # quote day-close fallback only after confirming it on a live run.
+  previous_close_from_quote_day_close: false
+  category_map:
+    GOLD: bullion
+    GOLDM: bullion
+    GOLDGUINEA: bullion
+    GOLDPETAL: bullion
+    SILVER: bullion
+    SILVERM: bullion
+    SILVERMIC: bullion
+    SILVER1000: bullion
+    CRUDEOIL: energy
+    CRUDEOILM: energy
+    NATURALGAS: energy
+    NATGASMINI: energy
+    COPPER: base_metal
+    ALUMINIUM: base_metal
+    ALUMINI: base_metal
+    ZINC: base_metal
+    ZINCMINI: base_metal
+    LEAD: base_metal
+    LEADMINI: base_metal
+    NICKEL: base_metal
+    COTTONCNDY: agri
+    MENTHAOIL: agri
