@@ -479,8 +479,15 @@ class CandlePipeline(LoopBound):
         self.on_closed(candle)
         for agg in self.higher.values():
             if agg.source == candle.timeframe:
-                for res in agg.add(candle):
+                results = agg.add(candle)
+                for res in results:
                     self._handle(res)
+                if not results:
+                    # a late (verified / repaired) constituent completing a higher-timeframe bucket
+                    # that already closed as GAP: rebuild it instead of leaving the gap unrepairable
+                    rebuilt = agg.try_complete_gap(candle)
+                    if rebuilt is not None:
+                        self.repair(rebuilt)
 
     def on_m1_closed(self, m1: Candle) -> None:
         if m1.open_time in self._seen_m1:
@@ -701,8 +708,8 @@ class CandlePipeline(LoopBound):
     def repair(self, candle: Candle) -> bool:
         """Repair the oldest unresolved gap with the exact broker candle for that bucket."""
         self._check_thread("repair")
-        gap = next((g for g in self.gaps if not g.resolved), None)
-        if gap is None or candle.timeframe is not gap.timeframe or candle.open_time != gap.open_time or not candle.is_closed:
+        gap = next((g for g in self.gaps if not g.resolved and g.timeframe is candle.timeframe and g.open_time == candle.open_time), None)
+        if gap is None or not candle.is_closed:
             return False
         gap.resolved_at = self._clock()
         self.metrics.inc("gaps_repaired")

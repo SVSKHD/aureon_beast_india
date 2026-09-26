@@ -143,6 +143,13 @@ class Application:
         self.crashes = CrashReporter(None, self.events, now=self._now, started_at=self._now())
         self.started_at = self._now()
         self._market_state = None
+        self.db_stats: dict[str, Any] = {}
+        self._tick_times: deque[datetime] = deque(maxlen=5000)
+        self.api = None
+        from aureon_mcx.discord.ops import OpsChannel
+
+        self.ops = OpsChannel(now=self._now, metrics=self.metrics)
+        self.events.subscribe(self.ops.on_event)
         self._last_packet_at: datetime | None = None
         self._feed_stalled = False
         self._feed_generation = 0
@@ -689,17 +696,11 @@ class Application:
                     self._spawn(self.reconcile(sym), name=f"reconcile:{sym}")
 
     def _retry_allowed(self, now: datetime) -> bool:
-        """Retries run while the market is open, plus a short grace after the close."""
+        """Retries run while the calendar covers the date; incidents themselves are only kept for
+        the current trading day (a minute from today's session is verifiable after the close,
+        when the broker publishes its final bars), so nothing busy-loops on a closed market."""
         assert self.calendar is not None
-        d = self.calendar.trading_date(now)
-        if not self.calendar.covers(d):
-            return False
-        if self.calendar.is_open(now):
-            return True
-        if not self.calendar.is_trading_day(d):
-            return False
-        _, end = self.calendar.trading_day_span(d)
-        return end <= now <= end + timedelta(minutes=10)
+        return self.calendar.covers(self.calendar.trading_date(now))
 
     def _sync_incidents(self, sym: str) -> None:
         """Incidents whose condition the pipeline no longer reports are RESOLVED (e.g. a pending
@@ -793,9 +794,13 @@ class Application:
             from aureon_mcx.discord.coalescer import UpdateCoalescer
             from aureon_mcx.discord.message_refs import MessageRefs
 
+            from aureon_mcx.api.status import StatusProjection
+            from aureon_mcx.discord.ops import OpsCommands
+
             refs = MessageRefs(self.repos)
             self.sink = DiscordSink(UpdateCoalescer(refs, cfg.analysis.discord.debounce_seconds))
-            self.discord_client = create_client(cfg, self.repos, self.sink, refs, MonitorRegistry(self.repos))
+            self.discord_client = create_client(cfg, self.repos, self.sink, refs, MonitorRegistry(self.repos), ops=self.ops,
+                                                commands=OpsCommands(StatusProjection(self)))
         else:
             log.warning("discord_disabled %s", kv(reason="DISCORD_TOKEN / DISCORD_CHANNEL_ID not set; running headless"))
             self.sink = NullSink()
@@ -809,7 +814,8 @@ class Application:
                 self.feed.on_status = self._on_feed_status
         else:
             self.feed = DhanLiveFeedProvider(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value(),
-                                             cfg.env.EXCHANGE_SEGMENT, self._on_tick, self._on_feed_status)
+                                             cfg.env.EXCHANGE_SEGMENT, self._on_tick, self._on_feed_status, closed_backoff=300.0,
+                                             is_market_open=lambda: self.calendar.is_open(self._now()), now=self._now)
         await self.feed.subscribe(ids)
         self._build_pipelines()
         for rt in self.runtimes.values():
@@ -853,10 +859,103 @@ class Application:
                                    + [self.health.status_line()]))
         self._specs["housekeeping"] = TaskSpec("housekeeping", self._housekeeping_loop, critical=True)
         self._start("housekeeping")
+        self._refresh_db_stats()
+        await self._start_scanner(cfg)
+        self._start_api(cfg)
         self._step(14, "service health published")
         log.info("service_health %s", kv(**{k: v["status"] for k, v in self.health.snapshot()["components"].items()}))
         await self._supervise()
         await self.shutdown()
+
+    # ----------------------------------------------------------- projections
+    def tick_rate(self) -> float | None:
+        """Ticks per minute over the last minute (deep feed)."""
+        if not self._tick_times:
+            return None
+        now = self._now()
+        recent = sum(1 for t in self._tick_times if now - t <= timedelta(minutes=1))
+        return float(recent)
+
+    def _refresh_db_stats(self) -> None:
+        """Cheap aggregate counts for the status API, refreshed by housekeeping (never per request)."""
+        if self.repos is None:
+            return
+        try:
+            rows = self.repos.db.query("SELECT state, COUNT(*) AS n FROM setups WHERE closed_at IS NULL GROUP BY state")
+            backlog = self.repos.db.query_one(
+                """SELECT COUNT(*) AS n FROM feature_snapshots s WHERE NOT EXISTS (
+                       SELECT 1 FROM outcome_observations o WHERE o.snapshot_id = s.id AND o.horizon = '__all_final__')""")
+            self.db_stats = {"setups_by_state": {r["state"]: int(r["n"]) for r in rows}, "outcome_backlog": int(backlog["n"]) if backlog else 0,
+                             "refreshed_at": self._now().isoformat()}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("db_stats_failed %s", kv(error=type(exc).__name__))
+
+    # ------------------------------------------------------------------ api
+    def _start_api(self, cfg: AppConfig) -> None:
+        if not cfg.env.AUREON_API_ENABLED:
+            self.agents.set_state("api_agent", "STOPPED", "AUREON_API_ENABLED=false")
+            return
+        from aureon_mcx.api import ApiServer
+
+        self.api = ApiServer(self, cfg.env.AUREON_API_HOST, cfg.env.AUREON_API_PORT)
+        self._specs["api"] = TaskSpec("api", lambda: self.api.run(self.stop), critical=False, max_restarts=1000, agent="api_agent",
+                                      backoff=(2.0, 5.0, 10.0, 30.0))
+        self._start("api")
+
+    # --------------------------------------------------------------- scanner
+    async def _start_scanner(self, cfg: AppConfig) -> None:
+        """Tier-1 scanner: its own feed connection(s) (partitioned within Dhan's documented
+        limits) deliver packets to the scanner only; the deep observer's feed is untouched."""
+        if self.scanner is None:
+            self.agents.set_state("scanner_agent", "STOPPED", "scanner disabled")
+            return
+        parts = self.scanner.partitions
+        if not parts:
+            self.agents.set_state("scanner_agent", "STOPPED", "empty universe")
+            return
+        for i, ids in enumerate(parts):
+            if self._scanner_feed_factory is not None:
+                feed = self._scanner_feed_factory(cfg, self.scanner.on_packet, i)
+            else:
+                feed = DhanLiveFeedProvider(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value(),
+                                            cfg.scanner.segments[0], lambda tick: None, lambda s, d, i=i: self._on_scanner_feed_status(i, s, d),
+                                            mode=cfg.scanner.feed_mode, on_packet=self.scanner.on_packet, closed_backoff=300.0,
+                                            is_market_open=lambda: self.calendar.is_open(self._now()), now=self._now)
+            await feed.subscribe(ids)
+            self.scanner_feeds.append(feed)
+            name = f"scanner_feed_{i}"
+            self._specs[name] = TaskSpec(name, (lambda f=feed: f.run(self.stop)), critical=False, max_restarts=1000, agent="scanner_agent",
+                                         backoff=(2.0, 5.0, 10.0, 30.0, 60.0))
+            self._start(name)
+        self._specs["scanner"] = TaskSpec("scanner", self._scanner_loop, critical=False, max_restarts=1000, agent="scanner_agent")
+        self._start("scanner")
+        self.agents.start("scanner_agent", universe=self.scanner.universe_size, connections=len(parts))
+        self.events.emit(EventType.SCANNER_UPDATED, f"scanner started: {self.scanner.universe_size} instruments over {len(parts)} feed connection(s)",
+                         agent="scanner_agent", dedupe_key="scanner:started", universe=self.scanner.universe_size, connections=len(parts))
+
+    def _on_scanner_feed_status(self, index: int, status: str, detail: dict) -> None:
+        if self.scanner is None:
+            return
+        self.agents.heartbeat("scanner_agent", **{f"feed_{index}": status})
+        if status == "connected":
+            self.events.emit(EventType.FEED_CONNECTED, f"scanner feed {index} connected", dedupe_key=f"scanner:feed:{index}:connected:{detail.get('reconnects', 0)}",
+                             agent="scanner_agent", connection=index)
+        elif status == "reconnecting" and self.calendar is not None and self.calendar.is_open(self._now()):
+            self.events.emit(EventType.FEED_RECONNECTING, f"scanner feed {index} reconnecting (attempt {detail.get('attempt')})", severity=Severity.WARNING,
+                             dedupe_key=f"scanner:feed:{index}:reconnecting", agent="scanner_agent", connection=index)
+
+    async def _scanner_loop(self) -> None:
+        assert self.stop is not None and self.scanner is not None
+        while not self.stop.is_set():
+            now = self._now()
+            self.scanner.tick(now)
+            st = self.scanner.status(now)
+            self.agents.heartbeat("scanner_agent", work=1, queue_depth=st["stale"] + st["unavailable"], universe=st["universe"],
+                                  advancers=st["advancers"], decliners=st["decliners"], stale=st["stale"])
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=self.scanner_interval)
+            except asyncio.TimeoutError:
+                pass
 
     # ----------------------------------------------------------- supervision
     def _start(self, name: str) -> None:
@@ -1029,16 +1128,18 @@ class Application:
         if not self.calendar.is_open(now):
             return
         limit = timedelta(seconds=2 * self.cfg.primary_timeframe.seconds + 60)
+        # closed-market time never counts: right after the open the reference is the session start
+        session_start, _ = self.calendar.trading_day_span(self.calendar.trading_date(now))
         for sym, rt in self.runtimes.items():
             sh = self.health.symbol(sym)
             if sh.state != "LIVE" or not sh.feed_connected or rt.pipeline is None:
                 continue
             last = rt.pipeline.last_closed.get(self.cfg.primary_timeframe)
-            if last is not None and now - last > limit:
+            if last is not None and now - max(last, session_start) > limit:
                 self.health.set_symbol_state(sym, "STALE", f"no closed {self.cfg.primary_timeframe.value} since {last.isoformat()}")
                 continue
             tick = sh.last_tick_at
-            if tick is not None and now - tick > timedelta(seconds=90):
+            if tick is not None and now - max(tick, session_start) > timedelta(seconds=90):
                 self.health.set_symbol_state(sym, "STALE", f"connected but no market data since {tick.isoformat()}")
 
     async def _housekeeping_loop(self) -> None:

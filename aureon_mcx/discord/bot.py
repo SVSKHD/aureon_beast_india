@@ -84,8 +84,10 @@ class MonitorRegistry:
         return " ".join(f"<@{u}>" for u in sorted(self.subscribers.get(setup_id, set())))
 
 
-def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: MessageRefs, monitors: MonitorRegistry):
+def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: MessageRefs, monitors: MonitorRegistry, ops=None, commands=None):
+    """`ops` is an OpsChannel (operational events -> embeds); `commands` an OpsCommands (informational slash commands)."""
     import discord
+    from discord import app_commands
 
     intents = discord.Intents.default()
 
@@ -109,10 +111,23 @@ def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: 
             self.channel_id = cfg.env.DISCORD_CHANNEL_ID
             self._status_message = None
             self._flush_task: asyncio.Task | None = None
+            self.tree = app_commands.CommandTree(self)
+            if commands is not None:
+                register_commands(self.tree, commands)
 
         async def setup_hook(self) -> None:
             for row in repos.message_refs.all():
                 self.add_view(MonitorView(int(row["setup_id"])), message_id=int(row["message_id"]))
+            if commands is not None:
+                try:
+                    if cfg.env.DISCORD_GUILD_ID:
+                        guild = discord.Object(id=cfg.env.DISCORD_GUILD_ID)
+                        self.tree.copy_global_to(guild=guild)
+                        await self.tree.sync(guild=guild)
+                    else:
+                        await self.tree.sync()
+                except Exception as exc:  # noqa: BLE001 - commands are optional; observation never depends on them
+                    log.warning("discord_command_sync_failed %s", kv(error=type(exc).__name__))
             self._flush_task = asyncio.create_task(self._flush_loop())
 
         async def on_ready(self) -> None:
@@ -157,6 +172,14 @@ def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: 
                     log.warning("discord_status_failed %s", kv(status=exc.status))
             for view in sink.coalescer.due():
                 await self._render_and_send(ch, view)
+            if ops is not None:
+                for msg in ops.due():
+                    try:
+                        await ch.send(embed=msg.to_embed())
+                        ops.mark_sent(msg, True)
+                    except discord.HTTPException as exc:
+                        ops.mark_sent(msg, False)
+                        log.warning("discord_ops_send_failed %s", kv(kind=msg.kind, status=exc.status))
 
         async def _render_and_send(self, ch, view: SetupView) -> None:
             spec = build_card(view)
@@ -195,3 +218,41 @@ def create_client(cfg: AppConfig, repos: Repositories, sink: DiscordSink, refs: 
                 log.warning("discord_send_failed %s", kv(setup_id=view.setup_id, status=exc.status))
 
     return AureonClient()
+
+
+def register_commands(tree, commands) -> None:
+    """Informational slash commands. They only render projections; nothing here trades."""
+    import discord
+    from discord import app_commands
+
+    async def _reply(interaction: discord.Interaction, msg) -> None:
+        await interaction.response.send_message(embed=msg.to_embed(), ephemeral=True)
+
+    @tree.command(name="status", description="Aureon system / market / agents status (observation only)")
+    async def status(interaction: discord.Interaction):
+        await _reply(interaction, commands.status())
+
+    @tree.command(name="crashes", description="Recent agent crashes and their recovery state")
+    async def crashes(interaction: discord.Interaction):
+        await _reply(interaction, commands.crashes())
+
+    @tree.command(name="market", description="MCX market state, session and next transition")
+    async def market(interaction: discord.Interaction):
+        await _reply(interaction, commands.market())
+
+    @tree.command(name="winners", description="Today's top gainers (verified previous close only)")
+    async def winners(interaction: discord.Interaction):
+        await _reply(interaction, commands.winners())
+
+    @tree.command(name="losers", description="Today's top losers (verified previous close only)")
+    async def losers(interaction: discord.Interaction):
+        await _reply(interaction, commands.losers())
+
+    @tree.command(name="agents", description="Every Aureon agent and its state")
+    async def agents(interaction: discord.Interaction):
+        await _reply(interaction, commands.agents())
+
+    @tree.command(name="symbol", description="Detailed status of a monitored symbol")
+    @app_commands.describe(symbol="Logical symbol, e.g. GOLD")
+    async def symbol(interaction: discord.Interaction, symbol: str):
+        await _reply(interaction, commands.symbol(symbol))
