@@ -281,6 +281,22 @@ class CalendarSpecialSession(StrictModel):
         return self
 
 
+class CalendarPendingSession(StrictModel):
+    """A special session MCX announced without publishing its hours: the date stays CLOSED."""
+
+    date: str
+    name: str
+    note: str = ""
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        from datetime import date as _date
+
+        _date.fromisoformat(v.strip())
+        return v.strip()
+
+
 class ExchangeCalendarConfig(StrictModel):
     """`config/exchange_calendar.yaml`: the authoritative exchange calendar (fails loudly if malformed)."""
 
@@ -293,6 +309,7 @@ class ExchangeCalendarConfig(StrictModel):
     close_periods: list[ClosePeriod] = Field(default_factory=list)
     holidays: list[CalendarHoliday] = Field(default_factory=list)
     special_sessions: list[CalendarSpecialSession] = Field(default_factory=list)
+    pending_special_sessions: list[CalendarPendingSession] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _consistent(self) -> "ExchangeCalendarConfig":
@@ -302,6 +319,10 @@ class ExchangeCalendarConfig(StrictModel):
         specials = [x.date for x in self.special_sessions]
         if len(specials) != len(set(specials)):
             raise ValueError("exchange calendar: duplicate special session dates")
+        pending = [x.date for x in self.pending_special_sessions]
+        if set(pending) & set(specials):
+            raise ValueError("exchange calendar: a date cannot be both a special session and pending timings")
+        specials = specials + pending
         periods = sorted(self.close_periods, key=lambda p: p.from_date)
         for a, b in zip(periods, periods[1:]):
             if b.from_date <= a.to_date:
@@ -333,6 +354,16 @@ class SessionsConfig(StrictModel):
     # Authoritative exchange calendar (config/exchange_calendar.yaml); the loader requires the
     # file. None only for unit tests that build a SessionsConfig by hand (weekday defaults apply).
     calendar: ExchangeCalendarConfig | None = None
+    # Every configured calendar year (exchange_calendar.yaml, exchange_calendar_<YEAR>.yaml,
+    # calendars/*.yaml). Dates outside these years are CALENDAR_OUT_OF_RANGE (fail closed).
+    calendars: dict[int, ExchangeCalendarConfig] = Field(default_factory=dict)
+
+    @property
+    def calendar_years(self) -> list[int]:
+        years = set(self.calendars)
+        if self.calendar is not None and self.calendar.year is not None:
+            years.add(self.calendar.year)
+        return sorted(years)
 
     @field_validator("timezone")
     @classmethod

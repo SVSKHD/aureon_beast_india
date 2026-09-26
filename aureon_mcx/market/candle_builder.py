@@ -544,6 +544,9 @@ class CandlePipeline(LoopBound):
         first = floor_to(cs, 60, self.tz)
         if self.last_m1_open is not None and self.last_m1_open + timedelta(minutes=1) > first:
             first = self.last_m1_open + timedelta(minutes=1)
+        # a wall-clock jump (host suspend, calendar year change) must not turn into a scan over
+        # months of minutes: anything older than a day is reconnect-recovery territory
+        first = max(first, current_minute - timedelta(hours=24))
         found: list[datetime] = []
         m = first
         while m < current_minute:

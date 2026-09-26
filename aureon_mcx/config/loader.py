@@ -75,6 +75,25 @@ def load_env(env_file: str | os.PathLike | None = None) -> EnvSettings:
         raise ConfigError(f"invalid environment configuration: {exc}") from exc
 
 
+def load_calendars(cdir: Path) -> dict[int, ExchangeCalendarConfig]:
+    """All calendar files keyed by year: exchange_calendar.yaml, exchange_calendar_<YEAR>.yaml
+    and calendars/*.yaml. At least one is required; two files for the same year are an error."""
+    paths = [cdir / "exchange_calendar.yaml"] if (cdir / "exchange_calendar.yaml").exists() else []
+    paths += sorted(cdir.glob("exchange_calendar_*.yaml"))
+    if (cdir / "calendars").is_dir():
+        paths += sorted((cdir / "calendars").glob("*.yaml"))
+    if not paths:
+        raise ConfigError(f"missing config file: {cdir / 'exchange_calendar.yaml'} (no exchange calendar configured)")
+    out: dict[int, ExchangeCalendarConfig] = {}
+    for path in paths:
+        cal = _validate(ExchangeCalendarConfig, _read_yaml(path), path)
+        assert cal.year is not None
+        if cal.year in out:
+            raise ConfigError(f"duplicate exchange calendar for year {cal.year}: {path}")
+        out[cal.year] = cal
+    return out
+
+
 def load_config(config_dir: str | os.PathLike | None = None, env_file: str | os.PathLike | None = None) -> AppConfig:
     env = load_env(env_file)
     cdir = Path(config_dir) if config_dir is not None else Path(env.AUREON_CONFIG_DIR)

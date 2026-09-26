@@ -684,3 +684,49 @@ def test_critical_task_repeated_failure_shuts_down_safely(tmp_path, monkeypatch)
     assert app.stop.is_set()
     assert app.health.components["observer"].status == "error" and app.health.components["feed"].status == "error"
     assert sum(1 for n, _ in app.task_failures if n == "feed") == 6  # initial + 5 restarts
+
+
+def test_startup_fails_closed_outside_calendar_years(tmp_path, monkeypatch):
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    clock[0] = datetime(2027, 1, 2, 5, 0, tzinfo=timezone.utc)
+    with pytest.raises(StartupError, match="CALENDAR_OUT_OF_RANGE: MCX calendar for 2027 not installed"):
+        app.startup()
+    assert app.health.components["calendar"].status == "error"
+    assert app.runtimes == {}  # nothing was resolved or warmed under normal-trading assumptions
+
+
+def test_live_run_fails_closed_when_calendar_year_ends(tmp_path, monkeypatch):
+    from aureon_mcx.events import EventType
+
+    app, http, hist, feeds, clock = _app(tmp_path, monkeypatch, symbols="GOLD")
+    app.startup()
+
+    def feed_factory(cfg, on_tick, health):
+        f = FakeFeed(on_tick, clock, minutes=8, ids=("428291",))
+
+        async def run(stop):
+            f.connected = True
+            f.on_status("connected", {"reconnects": 0})
+            await asyncio.sleep(0.3)
+            series = m1_for("428291", NOW, NOW + timedelta(minutes=8))
+            for i in range(0, 6):
+                for t in ticks_for(series[i]):
+                    clock[0] = t.ts
+                    on_tick(t)
+                await f.wait_settled()
+            assert app.health.symbols["GOLD"].state == "LIVE"
+            clock[0] = datetime(2027, 1, 4, 5, 0, tzinfo=timezone.utc)  # the calendar year ended while running
+            await asyncio.sleep(1.0)  # housekeeping (0.2 s) notices
+            stop.set()
+
+        f.run = run
+        return f
+
+    app._feed_factory = feed_factory
+    asyncio.run(app.run())
+    assert app.health.components["calendar"].status == "error" and "2027 not installed" in app.health.components["calendar"].detail
+    assert app.health.symbols["GOLD"].state == "ERROR" and "CALENDAR_OUT_OF_RANGE" in app.health.symbols["GOLD"].detail
+    failures = [e for e in app.events.history if e.type is EventType.CALENDAR_FAILURE]
+    assert len(failures) == 1 and "MCX calendar for 2027 not installed" in failures[0].message
+    assert app.pipelines["428291"].gaps == [] or all(g.open_time < datetime(2027, 1, 1, tzinfo=timezone.utc) for g in app.pipelines["428291"].gaps)
+    assert app.task_failures == []

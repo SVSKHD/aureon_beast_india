@@ -33,14 +33,16 @@ from aureon_mcx.broker.dhan.errors import DhanCredentialsError
 from aureon_mcx.broker.dhan.historical import CachedHistoricalProvider, DhanHistoricalProvider
 from aureon_mcx.broker.dhan.live_feed import DhanLiveFeedProvider
 from aureon_mcx.config import AppConfig, ConfigError, load_config
+from aureon_mcx.agents import AgentRegistry
 from aureon_mcx.continuity import KIND_GAP, KIND_PENDING_MINUTE, ContinuityService
-from aureon_mcx.events import EventType, Severity, SystemEventBus
+from aureon_mcx.crash import CrashReporter
+from aureon_mcx.events import EventType, Severity, SystemEvent, SystemEventBus
 from aureon_mcx.health import HealthState
 from aureon_mcx.logging_setup import configure_logging, kv
 from aureon_mcx.market.candle import Candle
 from aureon_mcx.market.candle_builder import REASON_SILENT, REASON_SUSPECT, CandlePipeline, GapRecord, Tick
 from aureon_mcx.metrics import Metrics
-from aureon_mcx.market.sessions import SessionCalendar
+from aureon_mcx.market.sessions import CalendarOutOfRange, SessionCalendar
 from aureon_mcx.market.timeframe import Timeframe
 from aureon_mcx.market.timeutil import IST, utc_now
 from aureon_mcx.market.warmup import derive_h4, seed_pipeline, warmup_window
@@ -48,6 +50,7 @@ from aureon_mcx.observer import NullSink, PresentationSink, SymbolObserver
 from aureon_mcx.outcomes import OutcomeService
 from aureon_mcx.storage import Database, Repositories
 from aureon_mcx.storage.parquet_archive import ParquetArchive
+from aureon_mcx.version import short_sha, version_info
 
 log = logging.getLogger("aureon.app")
 
@@ -74,6 +77,13 @@ class TaskSpec:
     max_restarts: int = 5
     restarts: int = 0
     backoff: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+    agent: str = ""                     # agent id reported in crash reports / registry
+    last_crash_id: str | None = None    # resolved once the restarted task is healthy again
+    started_at: datetime | None = None
+
+
+TASK_AGENTS = {"feed": "market_feed_agent", "flush": "aggregation_agent", "housekeeping": "health_agent", "discord": "discord_agent",
+               "api": "api_agent", "scanner": "scanner_agent"}
 
 
 class Application:
@@ -87,7 +97,8 @@ class Application:
         self._http_factory = http_factory or (lambda cfg: DhanHttpClient(cfg.env.DHAN_CLIENT_ID.get_secret_value(), cfg.env.DHAN_ACCESS_TOKEN.get_secret_value()))
         self._instrument_provider_factory = instrument_provider_factory or (lambda cfg, http: DhanInstrumentProvider(
             cfg.symbols.instrument_master.url, cfg.symbols.instrument_master.cache_path, cfg.symbols.instrument_master.refresh_hours, http))
-        self._historical_factory = historical_factory or (lambda cfg, http: DhanHistoricalProvider(http, cfg.analysis.historical.max_days_per_request))
+        self._historical_factory = historical_factory or (lambda cfg, http: DhanHistoricalProvider(
+            http, cfg.analysis.historical.max_days_per_request, calendar=self.calendar))
         self._feed_factory = feed_factory
         self._sink_factory = sink_factory
         self._now = now
@@ -121,6 +132,10 @@ class Application:
         self._bg_tasks: set[asyncio.Task] = set()  # strong references: asyncio keeps only weak refs to tasks
         self.events = SystemEventBus(now=self._now)
         self.metrics = Metrics()
+        self.agents = AgentRegistry(self.events, now=self._now)
+        self.crashes = CrashReporter(None, self.events, now=self._now, started_at=self._now())
+        self.started_at = self._now()
+        self._market_state = None
         self._last_packet_at: datetime | None = None
         self._feed_stalled = False
         self._feed_generation = 0
@@ -133,7 +148,36 @@ class Application:
         task = self._loop.create_task(coro, name=name)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(self._bg_task_done)
         return task
+
+    def _report_operation_error(self, sym: str, op: str, exc: BaseException) -> None:
+        """An unexpected exception inside a continuity operation is a crash: reported durably,
+        isolated to that operation (the incident schedule retries it), never swallowed."""
+        rt = self.runtimes.get(sym)
+        rep = self.crashes.report("continuity", exc, agent="continuity_agent", task=f"{op}:{sym}", symbol=sym,
+                                  security_id=rt.contract.security_id if rt else None)
+        self.metrics.inc("crashes")
+        self.agents.error("continuity_agent", f"{op}:{sym}: {type(exc).__name__}: {exc}", state="DEGRADED", crash_id=rep.crash_id)
+
+    def _bg_task_done(self, task: asyncio.Task) -> None:
+        """A background operation (verify / repair / recover / reconcile / rollover) that raised is a
+        crash: reported durably, isolated to that operation, retried by the scheduler."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        name = task.get_name()
+        sym = name.split(":", 1)[1] if ":" in name else None
+        rt = self.runtimes.get(sym) if sym else None
+        rep = self.crashes.report("continuity", exc, agent="continuity_agent", task=name, symbol=sym,
+                                  security_id=rt.contract.security_id if rt else None)
+        self.task_failures.append((name, type(exc).__name__))
+        self.metrics.inc("crashes")
+        self.agents.error("continuity_agent", f"{name}: {type(exc).__name__}: {exc}", state="DEGRADED", crash_id=rep.crash_id)
+        for key in [k for k, v in self._inflight.items() if v and k[0] == sym]:
+            self._inflight[key] = False
 
     # ---------------------------------------------------------- compat views
     @property
@@ -179,6 +223,14 @@ class Application:
             cfg.env.DISCORD_TOKEN.get_secret_value() if cfg.env.DISCORD_TOKEN else None])
         self._step(1, "config loaded")
         self.calendar = SessionCalendar(cfg.sessions)
+        # never assume normal trading for a year nobody configured (fail closed)
+        try:
+            today = self.calendar.require_coverage(self._now())
+        except CalendarOutOfRange as exc:
+            self.health.set("calendar", "error", str(exc))
+            raise StartupError(f"CALENDAR_OUT_OF_RANGE: {exc}") from exc
+        self.health.set("calendar", "ok", f"{today.isoformat()} covered; years={self.calendar.years}; "
+                        f"verified={'yes' if self.calendar.verified else 'NO'}")
         # 2 credentials (never printed)
         if not cfg.env.has_dhan_credentials:
             raise DhanCredentialsError("DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN are not set")
@@ -213,8 +265,16 @@ class Application:
             # DECISION: PostgreSQL backend is selectable in config but not implemented; fail closed.
             raise StartupError(f"storage backend {cfg.env.AUREON_STORAGE_BACKEND!r} is not implemented in this build")
         self.db = Database(cfg.env.AUREON_LOCAL_DB_PATH)
+        before = self.db.query_one("SELECT COALESCE(MAX(version), 0) AS v FROM schema_version")["v"] \
+            if self.db.query_one("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'") else 0
         version = self.db.migrate({"calendar": self.calendar, "now": self._now()})
         self.repos = Repositories(self.db)
+        self.crashes.repos = self.repos
+        self.events.subscribe(self._persist_event)
+        self.agents.start("storage_agent", path=cfg.env.AUREON_LOCAL_DB_PATH, schema_version=version)
+        if version != before:
+            self.events.emit(EventType.DATABASE_MIGRATED, f"database migrated {before} -> {version}", agent="storage_agent",
+                             from_version=int(before), to_version=version)
         for c in contracts.values():
             self.repos.instruments.upsert_active(c.as_row())
         self._step(7, f"sqlite ready schema_version={version} path={cfg.env.AUREON_LOCAL_DB_PATH}")
@@ -287,6 +347,14 @@ class Application:
         seed_pipeline(p, rt.history)
         return p
 
+    def _persist_event(self, event: SystemEvent) -> None:
+        if self.repos is None:
+            return
+        try:
+            self.repos.events.insert(event.to_record())
+        except Exception as exc:  # noqa: BLE001 - persistence must never break the producer
+            log.warning("event_persist_failed %s", kv(type=event.type.value, error=type(exc).__name__))
+
     def _restore_incidents(self) -> None:
         """Unresolved incidents persisted by a previous run are re-queued (restart never forgets them)."""
         if self.continuity is None:
@@ -314,6 +382,7 @@ class Application:
         now = self._now()
         self._last_packet_at = now
         self.metrics.inc("ticks_received")
+        self.agents.heartbeat("market_feed_agent", work=1)
         rt = self._runtime_for_security(tick.security_id)
         if rt is None or rt.pipeline is None:
             return
@@ -459,6 +528,7 @@ class Application:
                 result = await asyncio.to_thread(self.continuity.fetch_m1, rt.contract, window[0], window[1])
             except Exception as exc:  # noqa: BLE001
                 log.exception("verification_error %s", kv(symbol=sym, error=type(exc).__name__))
+                self._report_operation_error(sym, "verify", exc)
                 self.continuity.incidents.attempt_failed(incs, f"{type(exc).__name__}: {exc}")
                 return self._settle_symbol_state(sym, True)
             verified, still = self.continuity.apply_verification(rt.contract, p, result)
@@ -494,6 +564,7 @@ class Application:
                 result = await asyncio.to_thread(self.continuity.fetch_m1, rt.contract, window[0], window[1])
             except Exception as exc:  # noqa: BLE001
                 log.exception("reconcile_error %s", kv(symbol=sym, error=type(exc).__name__))
+                self._report_operation_error(sym, "reconcile", exc)
                 return 0
             if not result.ok:
                 return 0
@@ -536,6 +607,7 @@ class Application:
             ok = outcome.ok
         except Exception as exc:  # noqa: BLE001
             log.exception("recovery_error %s", kv(symbol=sym, error=type(exc).__name__))
+            self._report_operation_error(sym, "recover", exc)
         finally:
             p.end_recovery()
         return self._settle_symbol_state(sym, ok)
@@ -554,6 +626,7 @@ class Application:
                     result = await asyncio.to_thread(self.continuity.fetch_gap_candle, rt.contract, gap.timeframe, gap.open_time)
                 except Exception as exc:  # noqa: BLE001
                     log.exception("repair_error %s", kv(symbol=sym, error=type(exc).__name__))
+                    self._report_operation_error(sym, "repair", exc)
                     self.continuity.incidents.attempt_failed([inc], f"{type(exc).__name__}: {exc}")
                     break
                 if gap.resolved:  # a late verified constituent completed the bucket meanwhile
@@ -602,9 +675,11 @@ class Application:
     def _retry_allowed(self, now: datetime) -> bool:
         """Retries run while the market is open, plus a short grace after the close."""
         assert self.calendar is not None
+        d = self.calendar.trading_date(now)
+        if not self.calendar.covers(d):
+            return False
         if self.calendar.is_open(now):
             return True
-        d = self.calendar.trading_date(now)
         if not self.calendar.is_trading_day(d):
             return False
         _, end = self.calendar.trading_day_span(d)
@@ -629,6 +704,11 @@ class Application:
         assert p is not None and self.cfg is not None and self.continuity is not None
         self._sync_incidents(sym)
         now = self._now()
+        if not self.calendar.covers(self.calendar.trading_date(now)):
+            # no calendar for this year: nothing can be trusted, no state is ever "LIVE" (fail closed)
+            self.health.set_symbol_state(sym, "ERROR", f"CALENDAR_OUT_OF_RANGE: MCX calendar for {self.calendar.trading_date(now).year} not installed",
+                                         unresolved_gaps=len(p.unresolved_gaps))
+            return False
         gaps = len(p.unresolved_gaps)
         pending = p.pending_minutes()
         closed_pending = [m for m in pending if m + timedelta(minutes=1) <= now]
@@ -719,8 +799,17 @@ class Application:
         for rt in self.runtimes.values():
             if rt.pipeline is not None:
                 rt.pipeline.bind_to_current_thread()
-        self.events.emit(EventType.APP_STARTED, "Aureon observer starting: " + ", ".join(f"{s}={c.security_id}" for s, c in self.contracts.items()),
-                         agent="health_agent")
+        vi = version_info()
+        self.events.emit(EventType.APP_STARTED, "Aureon observer starting: " + ", ".join(f"{s}={c.security_id}" for s, c in self.contracts.items())
+                         + f" (version {vi['app']}, git {vi['git_short']})", agent="health_agent", version=vi["app"], git_sha=vi["git_sha"])
+        self.events.emit(EventType.DEPLOYMENT_INFO, f"deployed version {vi['app']} git {vi['git_short']}", agent="health_agent",
+                         dedupe_key=f"deploy:{vi['git_sha']}", version=vi["app"], git_sha=vi["git_sha"], branch=vi["branch"], build=vi["build"])
+        for agent_id in ("calendar_agent", "aggregation_agent", "continuity_agent", "analysis_agent", "setup_agent", "outcome_agent",
+                         "rollover_agent", "health_agent"):
+            self.agents.start(agent_id)
+        self.agents.register("market_feed_agent", "Market feed", "Dhan WebSocket: subscriptions, packet timing, reconnects")
+        self.agents.start("market_feed_agent", subscriptions=len(ids))
+        self._market_watch(self._now())
         self._specs["feed"] = TaskSpec("feed", lambda: self.feed.run(self.stop), critical=True)
         self._start("feed")
         self._step(10, "websocket connecting")
@@ -735,9 +824,11 @@ class Application:
                                               critical=False, max_restarts=1000, backoff=(5.0, 15.0, 30.0, 60.0))
             self._start("discord")
             self.health.set("discord", "starting")
+            self.agents.start("discord_agent", mode="gateway")
             log.info("discord live")
         else:
             self.health.set("discord", "ok", "headless")
+            self.agents.set_state("discord_agent", "STOPPED", "headless (no DISCORD_TOKEN / DISCORD_CHANNEL_ID)")
         self._step(13, "discord started")
         # 14 health + housekeeping
         self.health.set("observer", "live")
@@ -754,6 +845,8 @@ class Application:
     # ----------------------------------------------------------- supervision
     def _start(self, name: str) -> None:
         spec = self._specs[name]
+        spec.agent = spec.agent or TASK_AGENTS.get(name, name)
+        spec.started_at = self._now()
         self._tasks[name] = asyncio.create_task(spec.factory(), name=name)
 
     async def _supervise(self) -> None:
@@ -779,10 +872,12 @@ class Application:
         exc = task.exception()
         if exc is None and (stopping or spec is None):
             return  # orderly exit at shutdown (or an unsupervised task): nothing to do
+        agent = spec.agent or TASK_AGENTS.get(name, name)
         if exc is None:
             # A supervised loop returned while the application is still running.  A feed
             # that "finishes" is a silent feed; a flush loop that finishes never closes a
             # candle again.  Treat it exactly like a crash so it is restarted / escalated.
+            exc = RuntimeError(f"task {name} returned while the application is running")
             self.task_failures.append((name, "TaskExited"))
             log.error("task_exited %s", kv(task=name, detail="returned while application running"))
             self.health.set(name, "error", "exited unexpectedly")
@@ -792,16 +887,29 @@ class Application:
             if spec is None:
                 return
             self.health.set(name, "error", f"{type(exc).__name__}: {str(exc)[:120]}")
+        # detect -> report (durable) -> isolate -> restart -> recover
+        rep = self.crashes.report(name, exc, agent=agent, task=name, restart_number=spec.restarts + 1)
+        self.metrics.inc("crashes")
+        spec.last_crash_id = rep.crash_id
+        self.agents.error(agent, f"{type(exc).__name__}: {exc}", state="DEGRADED", crash_id=rep.crash_id)
         if spec.restarts >= spec.max_restarts:
+            self.crashes.resolve(rep.crash_id, "failed")
             if spec.critical:
                 log.critical("task_restart_limit %s", kv(task=name, restarts=spec.restarts))
+                self.agents.set_state(agent, "FAILED", f"{name} failed {spec.restarts} times; shutting down")
                 self.health.set("observer", "error", f"{name} failed repeatedly; shutting down")
                 self.sink.status(self.health.status_line())
+                self.events.emit(EventType.AGENT_FAILED, f"{agent} failed permanently ({name} crashed {spec.restarts + 1} times); shutting down safely",
+                                 severity=Severity.CRITICAL, agent=agent, crash_id=rep.crash_id)
                 assert self.stop is not None
                 self.stop.set()
+            else:
+                self.agents.set_state(agent, "FAILED", f"{name} failed {spec.restarts} times; giving up (non-critical)")
             return
         delay = spec.backoff[min(spec.restarts, len(spec.backoff) - 1)] * self.task_backoff_scale
         spec.restarts += 1
+        self.metrics.inc("restarts")
+        self.agents.restarting(agent, spec.restarts, f"{type(exc).__name__}; restart {spec.restarts}/{spec.max_restarts} in {delay:.1f}s")
         self.sink.status(self.health.status_line())
         log.warning("task_restart %s", kv(task=name, delay=delay, attempt=spec.restarts))
         assert self.stop is not None
@@ -814,6 +922,20 @@ class Application:
             self.health.set("discord", "restarting")
         self._start(name)
 
+    def _recovery_check(self) -> None:
+        """A restarted task that has run cleanly for a while resolves its crash report (recovered)."""
+        now = self._now()
+        for name, spec in self._specs.items():
+            task = self._tasks.get(name)
+            if spec.last_crash_id is None or task is None or task.done() or spec.started_at is None:
+                continue
+            if (now - spec.started_at) >= timedelta(seconds=max(2.0, 5.0 * self.task_backoff_scale)):
+                self.crashes.resolve(spec.last_crash_id, "success")
+                spec.last_crash_id = None
+                self.agents.set_state(spec.agent or TASK_AGENTS.get(name, name), "HEALTHY", f"{name} recovered after restart {spec.restarts}")
+                if name != "discord":
+                    self.health.set(name, "ok", f"recovered after restart {spec.restarts}")
+
     # ------------------------------------------------------------------ loops
     async def _flush_loop(self) -> None:
         assert self.stop is not None
@@ -824,10 +946,66 @@ class Application:
                 p.flush_at(now)  # exceptions propagate to the supervisor (never swallowed)
             self._feed_watchdog(self._now())
             self._continuity_tick()
+            self._recovery_check()
+            self.agents.heartbeat("aggregation_agent", queue_depth=sum(len(p.unresolved_gaps) for p in self.pipelines.values()))
+            self.agents.heartbeat("continuity_agent", queue_depth=len(self.continuity.incidents.incidents) if self.continuity else 0)
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=self.flush_interval)
             except asyncio.TimeoutError:
                 pass
+
+    def _market_watch(self, now: datetime) -> None:
+        """Market state transitions (open / closed / session change / approaching close) as events."""
+        assert self.calendar is not None
+        ms = self.calendar.market_state(now)
+        prev = self._market_state
+        self._market_state = ms
+        self.agents.heartbeat("calendar_agent", state=ms.state, reason=ms.reason, session=ms.session, trading_date=ms.trading_date.isoformat(),
+                              next_open=ms.next_open.isoformat() if ms.next_open else None,
+                              next_close=ms.next_close.isoformat() if ms.next_close else None, holiday=ms.holiday)
+        if ms.reason == "CALENDAR_OUT_OF_RANGE":
+            self.agents.set_state("calendar_agent", "ERROR", ms.detail)
+        elif self.agents.get("calendar_agent").state == "ERROR":
+            self.agents.set_state("calendar_agent", "HEALTHY", "calendar covers the trading date")
+        if prev is None or (prev.state, prev.reason, prev.session, prev.trading_date) == (ms.state, ms.reason, ms.session, ms.trading_date):
+            pass
+        elif ms.is_open and not prev.is_open:
+            label = "EVENING SESSION OPEN" if ms.session == "EVENING" else ("SPECIAL SESSION OPEN" if ms.session == "SPECIAL" else "MARKET OPEN")
+            self.events.emit(EventType.MARKET_OPENED, f"MCX {label} - {ms.detail}", dedupe_key=f"market:open:{ms.trading_date}:{ms.session}",
+                             agent="calendar_agent", **ms.to_dict())
+        elif not ms.is_open and prev.is_open:
+            label = {"EVENING_SESSION_CLOSED": "MORNING SESSION CLOSED", "OUTSIDE_TRADING_HOURS": "MARKET CLOSED"}.get(ms.reason, f"CLOSED - {ms.reason}")
+            if prev.session == "EVENING" and ms.reason == "OUTSIDE_TRADING_HOURS":
+                label = "EVENING SESSION CLOSED"
+            self.events.emit(EventType.MARKET_CLOSED, f"MCX {label} - {ms.detail}" + (f"; next open {ms.next_open.isoformat()}" if ms.next_open else ""),
+                             dedupe_key=f"market:closed:{ms.trading_date}:{ms.reason}:{prev.session}", agent="calendar_agent", **ms.to_dict())
+        elif ms.is_open and prev.is_open and ms.session != prev.session:
+            self.events.emit(EventType.MARKET_SESSION_CHANGED, f"MCX {ms.session} session - {ms.detail}", dedupe_key=f"market:session:{ms.trading_date}:{ms.session}",
+                             agent="calendar_agent", **ms.to_dict())
+        elif not ms.is_open and not prev.is_open and ms.reason != prev.reason:
+            label = {"WEEKEND": "MCX CLOSED - weekend", "FULL_HOLIDAY": f"MCX CLOSED - {ms.holiday}", "MORNING_SESSION_CLOSED": "MCX MORNING SESSION CLOSED",
+                     "SPECIAL_SESSION_PENDING": f"MCX CLOSED - {ms.holiday} (timings pending)"}.get(ms.reason, f"MCX CLOSED - {ms.reason}")
+            self.events.emit(EventType.MARKET_CLOSED, f"{label}" + (f"; next open {ms.next_open.isoformat()}" if ms.next_open else ""),
+                             dedupe_key=f"market:closed:{ms.trading_date}:{ms.reason}", agent="calendar_agent", **ms.to_dict())
+        if ms.is_open and ms.closes_at is not None and timedelta(0) < ms.closes_at - now <= timedelta(minutes=10):
+            self.events.emit(EventType.MARKET_CLOSING_SOON, f"MCX closes at {ms.closes_at.astimezone(IST).strftime('%H:%M')} IST",
+                             dedupe_key=f"market:closing_soon:{ms.trading_date}:{ms.closes_at.isoformat()}", agent="calendar_agent")
+
+    def _calendar_check(self) -> None:
+        """Live mode: when the trading date rolls into a year without a calendar, fail closed
+        (symbols ERROR, no gaps invented, loud event) instead of assuming normal hours."""
+        assert self.calendar is not None
+        try:
+            self.calendar.require_coverage(self._now())
+        except CalendarOutOfRange as exc:
+            if self.health.components.get("calendar") is not None and self.health.components["calendar"].status == "error":
+                return
+            self.health.set("calendar", "error", str(exc))
+            for sym in self.runtimes:
+                self.health.set_symbol_state(sym, "ERROR", f"CALENDAR_OUT_OF_RANGE: {exc}")
+            self.events.emit(EventType.CALENDAR_FAILURE, f"CALENDAR_OUT_OF_RANGE: {exc}; observation suspended", severity=Severity.CRITICAL,
+                             dedupe_key=f"calendar:out_of_range:{exc.session_date.year}", agent="calendar_agent")
+            self.sink.status(f"CALENDAR_OUT_OF_RANGE: {exc}")
 
     def _stale_check(self) -> None:
         assert self.cfg is not None and self.calendar is not None
@@ -859,6 +1037,10 @@ class Application:
             if self.stop.is_set():
                 break
             self._stale_check()
+            self._calendar_check()
+            self._market_watch(self._now())
+            self.agents.heartbeat("health_agent")
+            self.agents.check_heartbeats()
             line = self.health.status_line()
             if line != last_line:
                 last_line = line
@@ -963,6 +1145,9 @@ class Application:
         if self.stop is not None:
             self.stop.set()
         self.events.emit(EventType.APP_STOPPED, "Aureon observer stopping", agent="health_agent")
+        for a in self.agents.agents.values():
+            if a.state not in ("FAILED", "STOPPED"):
+                a.state = "STOPPED"
         if self.feed is not None and hasattr(self.feed, "disconnect"):
             try:
                 await self.feed.disconnect()
